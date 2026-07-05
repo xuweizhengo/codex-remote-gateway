@@ -42,7 +42,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { GatewayApi, truncateMiddle } from "./api";
-import type { AppConfig, DashboardResponse, EventItem, ProviderConfig, RequestLogItem, Tone } from "./types";
+import type { AppConfig, DashboardResponse, EventItem, LoggingStatus, ProviderConfig, RequestLogItem, Tone } from "./types";
 
 type PageKey = "overview" | "gateway" | "codex" | "chat" | "logs" | "settings";
 
@@ -106,10 +106,11 @@ const providerTemplates: ProviderConfig[] = [
 export default function App() {
   const [activePage, setActivePage] = useState<PageKey>("overview");
   const [api, setApi] = useState<GatewayApi | null>(null);
-  const [desktop, setDesktop] = useState({ baseUrl: "http://127.0.0.1:3847", version: "0.3.22", managedDaemon: false });
+  const [desktop, setDesktop] = useState({ baseUrl: browserBaseUrl(), version: "0.3.22", managedDaemon: false });
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [events, setEvents] = useState<EventItem[]>([]);
+  const [loggingStatus, setLoggingStatus] = useState<LoggingStatus | null>(null);
   const [logs, setLogs] = useState<RequestLogItem[]>([]);
   const [selectedLogId, setSelectedLogId] = useState<number | null>(null);
   const [lastSync, setLastSync] = useState<Date | null>(null);
@@ -122,7 +123,7 @@ export default function App() {
     async function boot() {
       const info = window.gateway
         ? await window.gateway.getBackendInfo()
-        : { baseUrl: "http://127.0.0.1:3847", version: "0.3.22", managedDaemon: false };
+        : { baseUrl: browserBaseUrl(), version: "0.3.22", managedDaemon: false };
       if (cancelled) return;
       setDesktop(info);
       setApi(new GatewayApi(info.baseUrl));
@@ -136,10 +137,16 @@ export default function App() {
   const refresh = useCallback(async () => {
     if (!api) return;
     try {
-      const [dashboardRes, configRes, eventsRes] = await Promise.all([api.dashboard(), api.config(), api.events()]);
+      const [dashboardRes, configRes, eventsRes, loggingRes] = await Promise.all([
+        api.dashboard(),
+        api.config(),
+        api.events(),
+        api.loggingStatus()
+      ]);
       setDashboard(dashboardRes);
       setConfig(configRes);
       setEvents(eventsRes.slice().reverse().slice(0, 8));
+      setLoggingStatus(loggingRes);
       try {
         const logRes = await api.requestLogs();
         setLogs(logRes.logs ?? []);
@@ -197,6 +204,7 @@ export default function App() {
     dashboard,
     config,
     events,
+    loggingStatus,
     providers,
     visibleModels,
     logs,
@@ -230,6 +238,12 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+function browserBaseUrl() {
+  return window.location.origin && window.location.origin !== "null"
+    ? window.location.origin
+    : "http://127.0.0.1:3847";
 }
 
 function Sidebar({
@@ -665,7 +679,14 @@ function LogsPage(props: PageProps) {
 }
 
 function SettingsPage(props: PageProps & { version: string }) {
-  const { config, updateConfig, version } = props;
+  const { api, config, loggingStatus, runAction, updateConfig, version } = props;
+  const [logDirDraft, setLogDirDraft] = useState("");
+  const canOpenLogDir = Boolean(window.gateway?.openPath && loggingStatus?.logDir);
+
+  useEffect(() => {
+    setLogDirDraft(String(config?.logging.logDir ?? loggingStatus?.logDir ?? ""));
+  }, [config?.logging.logDir, loggingStatus?.logDir]);
+
   return (
     <div className="settings-grid">
       <Panel title="本地服务">
@@ -728,9 +749,48 @@ function SettingsPage(props: PageProps & { version: string }) {
           />
           <span>诊断链路日志</span>
         </label>
-        <InfoRows rows={[["保留天数", `${config?.logging.retentionDays ?? 7} days`], ["最大日志", `${config?.logging.maxMb ?? 20} MB`]]} />
+        <InfoRows rows={[
+          ["当前目录", loggingStatus?.logDir ?? "-"],
+          ["当前文件", loggingStatus?.activeLogPath ?? "-"],
+          ["保留天数", `${config?.logging.retentionDays ?? 7} days`],
+          ["最大日志", `${config?.logging.maxMb ?? 20} MB`]
+        ]} />
+        <Field
+          label="自定义日志目录"
+          value={logDirDraft}
+          onChange={setLogDirDraft}
+          action={
+            <button
+              className="secondary-button small"
+              onClick={() =>
+                updateConfig((draft) => {
+                  draft.logging.logDir = logDirDraft.trim() ? logDirDraft.trim() : null;
+                }, "日志目录")
+              }
+            >
+              保存目录
+            </button>
+          }
+        />
+        <StatusLine tone="neutral" text="日志目录保存后，下次重启本地服务生效" />
         <div className="button-row">
-          <button className="secondary-button"><FileClock size={15} /> 打开日志目录</button>
+          <button
+            className="secondary-button"
+            onClick={() => runAction("清理日志", () => api?.clearLogging() ?? Promise.resolve())}
+          >
+            <Trash2 size={15} /> 清理日志
+          </button>
+          <button
+            className="secondary-button"
+            disabled={!canOpenLogDir}
+            onClick={() => {
+              if (loggingStatus?.logDir) {
+                void window.gateway?.openPath(loggingStatus.logDir);
+              }
+            }}
+          >
+            <FileClock size={15} /> 打开日志目录
+          </button>
           <button className="secondary-button"><DatabaseZap size={15} /> 导出诊断包</button>
         </div>
       </Panel>
@@ -758,6 +818,7 @@ interface PageProps {
   dashboard: DashboardResponse | null;
   config: AppConfig | null;
   events: EventItem[];
+  loggingStatus: LoggingStatus | null;
   providers: ProviderConfig[];
   visibleModels: string[];
   logs: RequestLogItem[];
@@ -1005,12 +1066,22 @@ function SelectLike({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Field({ label, value }: { label: string; value: string }) {
+function Field({
+  label,
+  value,
+  onChange,
+  action
+}: {
+  label: string;
+  value: string;
+  onChange?: (value: string) => void;
+  action?: React.ReactNode;
+}) {
   return (
     <label className="field">
       <span>{label}</span>
-      <input value={value} readOnly />
-      <ClipboardCopy size={15} />
+      <input value={value} readOnly={!onChange} onChange={(event) => onChange?.(event.target.value)} />
+      {action ?? (!onChange && <ClipboardCopy size={15} />)}
     </label>
   );
 }

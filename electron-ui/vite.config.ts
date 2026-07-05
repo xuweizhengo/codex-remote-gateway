@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 const devPort = Number(process.env.VITE_PORT || 5173);
 
 export default defineConfig({
+  base: "./",
   plugins: [react()],
   build: {
     outDir: "dist",

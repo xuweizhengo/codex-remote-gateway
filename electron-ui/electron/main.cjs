@@ -123,6 +123,12 @@ ipcMain.handle("gateway:openExternal", async (_event, url) => {
   await shell.openExternal(url);
 });
 
+ipcMain.handle("gateway:openPath", async (_event, targetPath) => {
+  if (!targetPath || typeof targetPath !== "string") return;
+  const error = await shell.openPath(targetPath);
+  if (error) throw new Error(error);
+});
+
 ipcMain.handle("gateway:quit", async () => {
   await quitApp();
 });

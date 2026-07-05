@@ -1,4 +1,4 @@
-import type { AppConfig, DashboardResponse, EventItem, RequestLogDetail, RequestLogItem } from "./types";
+import type { AppConfig, DashboardResponse, EventItem, LoggingStatus, RequestLogDetail, RequestLogItem } from "./types";
 
 export class GatewayApi {
   constructor(public readonly baseUrl: string) {}
@@ -17,6 +17,14 @@ export class GatewayApi {
 
   async events(): Promise<EventItem[]> {
     return this.get("/api/events");
+  }
+
+  async loggingStatus(): Promise<LoggingStatus> {
+    return this.get("/api/logging/status");
+  }
+
+  async clearLogging(): Promise<{ ok: boolean; chainLogsDeleted?: number; requestLogsDeleted?: number }> {
+    return this.post("/api/logging/clear", {});
   }
 
   async requestLogs(): Promise<{ logs: RequestLogItem[] }> {

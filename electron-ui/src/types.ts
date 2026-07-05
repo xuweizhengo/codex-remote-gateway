@@ -35,6 +35,7 @@ export interface AppConfig {
     diagnostic: boolean;
     maxMb: number;
     retentionDays: number;
+    logDir?: string | null;
   };
   bridge: {
     enabled: boolean;
@@ -129,4 +130,12 @@ export interface RequestLogDetail {
   log?: RequestLogItem;
   detail?: RequestLogItem;
   [key: string]: unknown;
+}
+
+export interface LoggingStatus {
+  logDir: string;
+  activeLogPath: string;
+  diagnostic: boolean;
+  maxMb: number;
+  retentionDays: number;
 }

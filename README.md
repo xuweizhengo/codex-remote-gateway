@@ -144,6 +144,12 @@ AI Gateway 解决的是“Codex 只认原生模型入口，但用户想用更多
 
 这些能力都在 GUI 中操作，不需要用户手写配置文件。
 
+## 日志目录与清理
+
+Windows 正常运行时，配置文件默认在 `%LOCALAPPDATA%\Codex Remote Gateway\config.toml`，链路日志默认写到 `%LOCALAPPDATA%\Codex Remote Gateway\logs\codex-remote-gateway-chain.log`。如果用 `--config` 指定了配置文件，默认日志目录会跟随该配置文件所在目录下的 `logs`。
+
+在 GUI 的“设置 / 日志与诊断”里可以查看当前日志目录和日志文件，也可以保存自定义日志目录。目录改动会写入 `logging.logDir`，重启本地服务后生效。这里也提供“清理日志”，会清理链路日志和 AI Gateway 请求日志。
+
 ## 交流与支持
 
 有问题可以提 GitHub issue，也可以关注公众号后直接发消息给我。

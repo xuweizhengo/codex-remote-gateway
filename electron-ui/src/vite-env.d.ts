@@ -8,6 +8,7 @@ interface GatewayDesktopApi {
     managedDaemon: boolean;
   }>;
   openExternal(url: string): Promise<void>;
+  openPath(targetPath: string): Promise<void>;
   quit(): Promise<void>;
 }
 

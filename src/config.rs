@@ -91,6 +91,8 @@ pub struct LoggingConfig {
     pub diagnostic: bool,
     pub max_mb: u64,
     pub retention_days: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -174,6 +176,7 @@ impl Default for LoggingConfig {
             diagnostic: cfg!(debug_assertions),
             max_mb: 20,
             retention_days: 7,
+            log_dir: None,
         }
     }
 }
