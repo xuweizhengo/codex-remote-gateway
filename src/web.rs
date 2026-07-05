@@ -3,8 +3,8 @@ use axum::{
     body::Body,
     extract::State,
     http::{
-        Request, StatusCode,
-        header::{CACHE_CONTROL, EXPIRES, HeaderValue, PRAGMA},
+        HeaderValue, Method, Request, StatusCode,
+        header::{CACHE_CONTROL, EXPIRES, PRAGMA},
     },
     middleware::{self, Next},
     response::IntoResponse,
@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::json;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::{
     app_state::{FeishuWsState, ImAccountRuntimeState, SharedState, TelegramState, WechatState},
@@ -118,8 +119,26 @@ pub fn router(state: SharedState) -> Router {
         .merge(plugins::router())
         .merge(remote_control_backend::router())
         .nest("/ai-gateway", crate::ai_gateway::router())
+        .layer(electron_cors_layer())
         .layer(middleware::from_fn(access_log))
         .with_state(state)
+}
+
+fn electron_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
+                let Ok(origin) = origin.to_str() else {
+                    return false;
+                };
+                origin == "null"
+                    || origin.starts_with("http://127.0.0.1:")
+                    || origin.starts_with("http://localhost:")
+                    || origin.starts_with("http://[::1]:")
+            },
+        ))
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers(Any)
 }
 
 async fn access_log(request: Request<Body>, next: Next) -> impl IntoResponse {

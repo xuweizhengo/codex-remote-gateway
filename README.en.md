@@ -235,6 +235,20 @@ cargo test
 cargo build --release --features gui --bin codex-remote-gateway
 ```
 
+The Electron GUI lives in `electron-ui/`; the Rust core still runs through the `daemon` command. For local UI development:
+
+```powershell
+cd electron-ui
+npm install
+npm run dev
+```
+
+You can also launch the Electron GUI through the Rust entrypoint:
+
+```powershell
+cargo run --features gui -- gui
+```
+
 Useful status endpoints while the daemon is running:
 
 ```text

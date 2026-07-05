@@ -227,6 +227,20 @@ cargo test
 cargo build --release --features gui --bin codex-remote-gateway
 ```
 
+Electron GUI 位于 `electron-ui/`，Rust 核心仍然通过 `daemon` 命令运行。开发时可以用下面的方式启动新界面：
+
+```powershell
+cd electron-ui
+npm install
+npm run dev
+```
+
+也可以从 Rust 入口启动 Electron GUI：
+
+```powershell
+cargo run --features gui -- gui
+```
+
 daemon 运行时常用状态接口：
 
 ```text

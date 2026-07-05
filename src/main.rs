@@ -9,8 +9,7 @@ mod codex;
 mod codex_app_config;
 mod codex_session_history;
 mod config;
-#[cfg(feature = "gui")]
-mod gui;
+mod electron_gui;
 mod im;
 mod im_runtime;
 mod remote_control_backend;
@@ -43,7 +42,8 @@ use crate::{
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse()?;
     if matches!(cli.command, Command::Gui) {
-        return run_gui_command();
+        let config_path = config_path_from_cli(cli.config_path.clone());
+        return run_gui_command(config_path);
     }
 
     let config_path = config_path_from_cli(cli.config_path.clone());
@@ -132,17 +132,8 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run_gui_command() -> anyhow::Result<()> {
-    #[cfg(feature = "gui")]
-    {
-        gui::run();
-        Ok(())
-    }
-
-    #[cfg(not(feature = "gui"))]
-    {
-        anyhow::bail!("this codex-remote-gateway build does not include GUI support")
-    }
+fn run_gui_command(config_path: PathBuf) -> anyhow::Result<()> {
+    electron_gui::run(config_path)
 }
 
 async fn run_daemon(config_path: PathBuf, config: AppConfig) -> anyhow::Result<()> {
