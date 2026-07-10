@@ -87,6 +87,7 @@ pub enum TurnOrigin {
     Feishu,
     Telegram,
     Wechat,
+    Wecom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +518,7 @@ pub fn route_from_conversation_key(conversation_key: &str) -> Option<RouteTarget
         "feishu" => ImPlatformKind::Feishu,
         "telegram" => ImPlatformKind::Telegram,
         "wechat" => ImPlatformKind::Wechat,
+        "wecom" => ImPlatformKind::Wecom,
         _ => return None,
     };
     let account_id = parts.next()?.to_string();
@@ -676,6 +678,13 @@ mod tests {
         assert_eq!(telegram.account_id, "bot");
         assert_eq!(telegram.chat_id, "chat:123");
         assert!(telegram.remote_client_key.starts_with("im:telegram:"));
+
+        let wecom =
+            route_from_conversation_key("wecom:corp-bot:group:room-1").expect("wecom route");
+        assert_eq!(wecom.platform, ImPlatformKind::Wecom);
+        assert_eq!(wecom.account_id, "corp-bot");
+        assert_eq!(wecom.chat_id, "group:room-1");
+        assert!(wecom.remote_client_key.starts_with("im:wecom:"));
 
         assert!(route_from_conversation_key("slack:team:channel").is_none());
     }

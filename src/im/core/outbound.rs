@@ -16,6 +16,7 @@ use crate::{
             api::WechatApi,
             store as wechat_store,
         },
+        wecom::{adapter::WecomAdapter, api::WecomApi},
     },
     im_runtime::{PendingApproval, RouteTarget},
     types::ImPlatformKind,
@@ -120,6 +121,13 @@ pub(crate) async fn run_worker(
                 };
                 send_feishu_outbound(&state, &api, message).await;
             }
+            ImPlatformKind::Wecom => {
+                let Some(api) = api_registry.wecom_for_route(&message.route) else {
+                    log_missing_api(&state, &message).await;
+                    continue;
+                };
+                send_wecom_outbound(&state, &api, message).await;
+            }
         }
     }
     state
@@ -188,6 +196,72 @@ async fn outbound_channel_enabled(state: &SharedState, route: &RouteTarget) -> b
         ImPlatformKind::Wechat => config
             .wechat_account(&route.account_id)
             .is_some_and(|account| account.is_active()),
+        ImPlatformKind::Wecom => config
+            .wecom_account(&route.account_id)
+            .is_some_and(|account| account.is_active()),
+    }
+}
+
+async fn send_wecom_outbound(
+    state: &SharedState,
+    wecom_api: &WecomApi,
+    message: ImOutboundMessage,
+) {
+    let adapter = WecomAdapter::new(wecom_api.clone());
+    let text = match &message.payload {
+        ImOutboundPayload::Text(text) => text.clone(),
+        ImOutboundPayload::Approval(approval) => {
+            crate::im::wechat::adapter::approval_text(approval, im_text_for_state(state))
+        }
+        ImOutboundPayload::Image {
+            caption,
+            fallback_text,
+            ..
+        } => fallback_text
+            .clone()
+            .or_else(|| caption.clone())
+            .unwrap_or_else(|| "[暂不支持图片或文件消息]".to_string()),
+    };
+    log_outbound_message("send_wecom_text_begin", &message, Some(&text));
+    match adapter
+        .send_text(
+            state,
+            &message.route.account_id,
+            &message.route.chat_id,
+            &text,
+        )
+        .await
+    {
+        Ok(message_id) => {
+            log_outbound_result("send_wecom_text_done", &message, &message_id);
+            state
+                .push_event(
+                    "info",
+                    match message.kind {
+                        ImOutboundKind::TurnReply => "wecom_turn_completed_sent",
+                        ImOutboundKind::Approval => "wecom_approval_sent",
+                        ImOutboundKind::Item | ImOutboundKind::ImageItem => "wecom_item_sent",
+                    },
+                    format!(
+                        "thread={} chat={} message={message_id}",
+                        message.thread_id, message.route.chat_id
+                    ),
+                )
+                .await;
+        }
+        Err(err) => {
+            log_outbound_result("send_wecom_text_failed", &message, &err.to_string());
+            state
+                .push_event(
+                    "error",
+                    "wecom_send_failed",
+                    format!(
+                        "thread={} chat={} err={err}",
+                        message.thread_id, message.route.chat_id
+                    ),
+                )
+                .await;
+        }
     }
 }
 

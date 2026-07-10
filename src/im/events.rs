@@ -122,7 +122,7 @@ pub(crate) async fn send_turn_reply(
     if !should_send {
         if matches!(
             route.platform,
-            ImPlatformKind::Telegram | ImPlatformKind::Wechat
+            ImPlatformKind::Telegram | ImPlatformKind::Wechat | ImPlatformKind::Wecom
         ) {
             let event_kind = format!("{}_turn_reply_skipped", route.platform.key());
             state
@@ -298,6 +298,38 @@ pub(crate) async fn send_turn_reply(
                 }
             }
         }
+        ImPlatformKind::Wecom => {
+            let rendered = text_renderer::render_agent_message_text(text);
+            let Some(outbound_tx) = outbound_tx else {
+                state
+                    .push_event(
+                        "error",
+                        "wecom_turn_enqueue_failed",
+                        format!(
+                            "thread={thread_id} chat={} outbound queue unavailable",
+                            route.chat_id
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if let Err(err) = outbound_tx.enqueue(ImOutboundMessage {
+                thread_id: thread_id.to_string(),
+                route: route.clone(),
+                item_id: None,
+                item_type: Some("agentMessage".to_string()),
+                kind: ImOutboundKind::TurnReply,
+                payload: ImOutboundPayload::Text(rendered),
+            }) {
+                state
+                    .push_event(
+                        "error",
+                        "wecom_turn_enqueue_failed",
+                        format!("thread={thread_id} chat={} err={err}", route.chat_id),
+                    )
+                    .await;
+            }
+        }
     }
 }
 
@@ -381,7 +413,7 @@ async fn send_turn_completed_mark(
                 }
             }
         }
-        ImPlatformKind::Telegram | ImPlatformKind::Wechat => {
+        ImPlatformKind::Telegram | ImPlatformKind::Wechat | ImPlatformKind::Wecom => {
             if let Err(err) = outbound_tx.enqueue(ImOutboundMessage {
                 thread_id: thread_id.to_string(),
                 route: route.clone(),
@@ -732,7 +764,7 @@ pub(crate) async fn handle_codex_notification(
             };
             if matches!(
                 route.platform,
-                ImPlatformKind::Telegram | ImPlatformKind::Wechat
+                ImPlatformKind::Telegram | ImPlatformKind::Wechat | ImPlatformKind::Wecom
             ) {
                 if item_type == "agentMessage"
                     && let Some(text) = extract_agent_message_text(item)
@@ -1003,6 +1035,7 @@ fn turn_origin_for_platform(platform: ImPlatformKind) -> Option<TurnOrigin> {
         ImPlatformKind::Feishu => Some(TurnOrigin::Feishu),
         ImPlatformKind::Telegram => Some(TurnOrigin::Telegram),
         ImPlatformKind::Wechat => Some(TurnOrigin::Wechat),
+        ImPlatformKind::Wecom => Some(TurnOrigin::Wecom),
     }
 }
 

@@ -169,6 +169,22 @@ Optional allowlist of WeChat user ids.
 
 Empty means no user-level allowlist.
 
+## WeCom (Enterprise WeChat)
+
+```toml
+[wecom]
+enabled = true
+accountId = "wecom"
+botId = ""
+secret = ""
+displayName = "企业微信机器人"
+websocketUrl = "wss://openws.work.weixin.qq.com"
+allowedUserIds = []
+allowedChatIds = []
+```
+
+The GUI QR flow normally writes `botId` and `secret`. CodexHub then subscribes to the official WeCom AI Bot WebSocket and supports direct/group text, final replies, thread routing, and text approvals. Empty allowlists accept all users and chats. Keep `secret` private. Streaming replies, images/files, and template cards are deferred to phase 2.
+
 ## Bridge
 
 ```toml
@@ -182,7 +198,7 @@ sendStreaming = true
 
 Controls whether the IM bridge should run.
 
-When disabled, Feishu websocket listening, Telegram polling, and WeChat polling stop, and IM messages are not forwarded to Codex.
+When disabled, Feishu and WeCom websocket listening, Telegram polling, and WeChat polling stop, and IM messages are not forwarded to Codex.
 
 ### `accountId`
 
@@ -192,6 +208,7 @@ Local label used to build route keys:
 feishu:<accountId>:<chatId>
 telegram:<accountId>:<chatId>
 wechat:<accountId>:<userId>
+wecom:<accountId>:<userId-or-groupChatId>
 ```
 
 ### `sendStreaming`

@@ -13,6 +13,7 @@ pub enum ImPlatformKind {
     Feishu,
     Telegram,
     Wechat,
+    Wecom,
 }
 
 impl Default for ImPlatformKind {
@@ -27,6 +28,7 @@ impl ImPlatformKind {
             Self::Feishu => "feishu",
             Self::Telegram => "telegram",
             Self::Wechat => "wechat",
+            Self::Wecom => "wecom",
         }
     }
 }

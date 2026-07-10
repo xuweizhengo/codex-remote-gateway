@@ -13,6 +13,7 @@ use crate::{
                 route_for_message,
             },
             session::{create_and_bind_thread, resume_and_bind_thread},
+            text_adapter::TextChatAdapter,
             thread::{
                 ThreadCreateOption, apply_thread_create_draft_value, create_options_for_field,
                 expand_home_prefix, is_approval_reply, load_thread_create_defaults_for_client,
@@ -63,6 +64,25 @@ pub(crate) async fn handle_inbound(
     let settings = WechatSettings::from_app_config(&wechat_config);
     let api = WechatApi::new(settings);
     let adapter = WechatAdapter::new(api);
+    handle_text_inbound(
+        state,
+        outbound_tx,
+        message,
+        &adapter,
+        TurnOrigin::Wechat,
+        "wechat",
+    )
+    .await
+}
+
+pub(crate) async fn handle_text_inbound(
+    state: SharedState,
+    outbound_tx: ImOutboundSender,
+    message: InboundMessage,
+    adapter: &dyn TextChatAdapter,
+    turn_origin: TurnOrigin,
+    platform_key: &str,
+) -> Result<()> {
     let account_id = message.account_id.clone();
     let route = route_for_message(&message);
     let text = im_text_for_state(&state);
@@ -91,12 +111,11 @@ pub(crate) async fn handle_inbound(
             .await
             .has_pending_approvals(&message.conversation_key())
     {
-        handle_wechat_approval_text_reply(&state, &outbound_tx, &adapter, &message, command)
-            .await?;
+        handle_wechat_approval_text_reply(&state, &outbound_tx, adapter, &message, command).await?;
         return Ok(());
     }
 
-    if handle_thread_create_custom_cwd_text_input(&state, &adapter, &message, trimmed).await? {
+    if handle_thread_create_custom_cwd_text_input(&state, adapter, &message, trimmed).await? {
         crate::chain_log::write_line(format!(
             "[wechat_flow] event=inbound_handled stage=create_custom_cwd chat={}",
             message.chat_id
@@ -106,7 +125,7 @@ pub(crate) async fn handle_inbound(
 
     if handle_thread_create_option_text_reply(
         &state,
-        &adapter,
+        adapter,
         &message,
         trimmed,
         menu_command.as_deref(),
@@ -122,7 +141,7 @@ pub(crate) async fn handle_inbound(
 
     if handle_thread_create_settings_text_reply(
         &state,
-        &adapter,
+        adapter,
         &message,
         trimmed,
         menu_command.as_deref(),
@@ -137,7 +156,7 @@ pub(crate) async fn handle_inbound(
     }
 
     if let Some(command) = menu_command.as_deref()
-        && handle_thread_route_choice_text_reply(&state, &adapter, &message, command).await?
+        && handle_thread_route_choice_text_reply(&state, adapter, &message, command).await?
     {
         crate::chain_log::write_line(format!(
             "[wechat_flow] event=inbound_handled stage=route_choice chat={} command={}",
@@ -147,7 +166,7 @@ pub(crate) async fn handle_inbound(
     }
 
     if let Some(command) = menu_command.as_deref()
-        && handle_thread_list_text_reply(&state, &adapter, &message, command).await?
+        && handle_thread_list_text_reply(&state, adapter, &message, command).await?
     {
         crate::chain_log::write_line(format!(
             "[wechat_flow] event=inbound_handled stage=thread_list chat={} command={}",
@@ -278,7 +297,7 @@ pub(crate) async fn handle_inbound(
         trimmed,
         &message.attachments,
         message.received_at_ms,
-        TurnOrigin::Wechat,
+        turn_origin,
     )
     .await
     {
@@ -290,7 +309,7 @@ pub(crate) async fn handle_inbound(
             state
                 .push_event(
                     "info",
-                    "wechat_turn_started",
+                    &format!("{platform_key}_turn_started"),
                     format!(
                         "chat={} thread={} turn={turn_id}",
                         message.chat_id, thread_id
@@ -330,7 +349,7 @@ pub(crate) async fn handle_inbound(
             state
                 .push_event(
                     "warn",
-                    "wechat_inbound_expired",
+                    &format!("{platform_key}_inbound_expired"),
                     format!(
                         "chat={} thread={thread_id} message={}",
                         message.chat_id, message.message_id
@@ -344,7 +363,7 @@ pub(crate) async fn handle_inbound(
                 "[wechat_flow] event=no_thread_route chat={}",
                 message.chat_id
             ));
-            send_thread_routing_choice(&state, &adapter, &message).await?;
+            send_thread_routing_choice(&state, adapter, &message).await?;
             Ok(())
         }
         TurnStartOutcome::Stale { thread_id } => {
@@ -355,11 +374,11 @@ pub(crate) async fn handle_inbound(
             state
                 .push_event(
                     "warn",
-                    "wechat_thread_route_stale",
+                    &format!("{platform_key}_thread_route_stale"),
                     format!("conversation={} thread={thread_id}", route.conversation_key),
                 )
                 .await;
-            send_thread_routing_choice(&state, &adapter, &message).await
+            send_thread_routing_choice(&state, adapter, &message).await
         }
         TurnStartOutcome::Failed { error } => {
             crate::chain_log::write_line(format!(
@@ -381,7 +400,7 @@ pub(crate) async fn handle_inbound(
 
 async fn create_wechat_thread_for_route(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     route: &RouteTarget,
     options: remote_control_backend::ThreadStartOptions,
     request_id: Option<&str>,
@@ -423,7 +442,7 @@ async fn create_wechat_thread_for_route(
 
 async fn send_thread_create_settings(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     existing_request: Option<ThreadRoutingRequestState>,
 ) -> Result<()> {
@@ -468,7 +487,7 @@ async fn send_thread_create_settings(
 
 async fn handle_thread_create_settings_text_reply(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     text: &str,
     command: Option<&str>,
@@ -549,7 +568,7 @@ async fn handle_thread_create_settings_text_reply(
 
 async fn create_wechat_thread_from_request(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     request: ThreadRoutingRequestState,
 ) -> Result<()> {
@@ -583,7 +602,7 @@ async fn create_wechat_thread_from_request(
 
 async fn send_thread_create_options(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     mut request: ThreadRoutingRequestState,
     field: &str,
@@ -657,7 +676,7 @@ async fn send_thread_create_options(
 
 async fn handle_thread_create_option_text_reply(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     text: &str,
     command: Option<&str>,
@@ -749,7 +768,7 @@ async fn handle_thread_create_option_text_reply(
 
 async fn handle_thread_create_custom_cwd_text_input(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     text: &str,
 ) -> Result<bool> {
@@ -810,7 +829,7 @@ async fn handle_thread_create_custom_cwd_text_input(
 
 async fn send_thread_create_custom_cwd_prompt(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
 ) -> Result<()> {
     adapter
@@ -922,7 +941,7 @@ fn looks_like_path(value: &str) -> bool {
 
 async fn send_thread_routing_choice(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
 ) -> Result<()> {
     let route = route_for_message(message);
@@ -947,7 +966,7 @@ async fn send_thread_routing_choice(
 
 async fn handle_thread_route_choice_text_reply(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     command: &str,
 ) -> Result<bool> {
@@ -986,7 +1005,7 @@ async fn handle_thread_route_choice_text_reply(
 
 async fn send_thread_routing_list(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     existing_request: Option<ThreadRoutingRequestState>,
     cursor: Option<&str>,
@@ -1061,7 +1080,7 @@ async fn send_thread_routing_list(
 
 async fn handle_thread_list_text_reply(
     state: &SharedState,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     command: &str,
 ) -> Result<bool> {
@@ -1188,7 +1207,7 @@ async fn handle_thread_list_text_reply(
 async fn handle_wechat_approval_text_reply(
     state: &SharedState,
     outbound_tx: &ImOutboundSender,
-    adapter: &WechatAdapter,
+    adapter: &dyn TextChatAdapter,
     message: &InboundMessage,
     command: &str,
 ) -> Result<()> {
