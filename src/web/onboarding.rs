@@ -479,7 +479,8 @@ pub(super) struct WecomOnboardPollRequest {
 }
 
 pub(super) async fn wecom_onboard_start(State(state): State<SharedState>) -> impl IntoResponse {
-    match wecom_onboarding::start(&state.ai_gateway_http_client).await {
+    let http_client = crate::outbound_http::get();
+    match wecom_onboarding::start(&http_client).await {
         Ok(qr) => {
             let session_key = format!("wecom-onboard-{}", unix_now_millis());
             let qr_svg = build_qr_svg(&qr.auth_url).unwrap_or_default();
@@ -533,7 +534,8 @@ pub(super) async fn wecom_onboard_poll(
         );
     }
 
-    match wecom_onboarding::poll(&state.ai_gateway_http_client, &session.scode).await {
+    let http_client = crate::outbound_http::get();
+    match wecom_onboarding::poll(&http_client, &session.scode).await {
         Ok(QrPoll::Pending(status)) => (
             StatusCode::OK,
             Json(json!({ "done": false, "status": status })),

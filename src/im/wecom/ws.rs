@@ -468,7 +468,7 @@ async fn collect_attachments(
     let Some(url) = media.get("url").and_then(Value::as_str) else {
         return Vec::new();
     };
-    let bytes = match state.ai_gateway_http_client.get(url).send().await {
+    let bytes = match crate::outbound_http::get().get(url).send().await {
         Ok(response) => match response.error_for_status() {
             Ok(response) => match response.bytes().await {
                 Ok(bytes) => bytes.to_vec(),
@@ -668,6 +668,7 @@ mod tests {
         AppState::new(
             std::env::temp_dir().join("codexhub-wecom-test.toml"),
             AppConfig::default(),
+            None,
             None,
         )
     }
