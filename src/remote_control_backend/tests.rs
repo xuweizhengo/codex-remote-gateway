@@ -20,6 +20,7 @@ fn test_state() -> SharedState {
         std::env::temp_dir().join("codexhub-test-config.toml"),
         config,
         None,
+        None,
     )
 }
 
@@ -72,6 +73,7 @@ fn test_connection(
     crate::app_state::RemoteControlServerConnection {
         connection_id: id.to_string(),
         connection_epoch,
+        default_client_key: source_default_client_key(source_kind),
         connected,
         initialized,
         source_kind,
@@ -407,6 +409,7 @@ fn connection_reset_removes_stale_initialize_state_but_keeps_replayable_requests
     client.pending.insert(
         "1".to_string(),
         PendingRemoteRequest {
+            connection_epoch: 0,
             method: "initialize".to_string(),
             thread_id: None,
             track_thread_active: false,
@@ -419,6 +422,7 @@ fn connection_reset_removes_stale_initialize_state_but_keeps_replayable_requests
     client.pending.insert(
         "2".to_string(),
         PendingRemoteRequest {
+            connection_epoch: 0,
             method: "thread/list".to_string(),
             thread_id: None,
             track_thread_active: true,
@@ -442,6 +446,114 @@ fn connection_reset_removes_stale_initialize_state_but_keeps_replayable_requests
     assert!(client.last_initialize_sent_at_ms.is_none());
     assert!(!client.pending.contains_key("1"));
     assert!(client.pending.contains_key("2"));
+}
+
+#[test]
+fn connection_cleanup_removes_only_initialize_for_closed_epoch() {
+    let mut remote = remote_inner_for_test("stream-root");
+    let client = ensure_client_state_locked(&mut remote, "default:unknown");
+    for (request_id, connection_epoch, method) in [
+        ("1", 11, "initialize"),
+        ("2", 12, "initialize"),
+        ("3", 11, "thread/list"),
+    ] {
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        client.pending.insert(
+            request_id.to_string(),
+            PendingRemoteRequest {
+                connection_epoch,
+                method: method.to_string(),
+                thread_id: None,
+                track_thread_active: method != "initialize",
+                response_tx,
+                message: json!({"id": request_id, "method": method}),
+                envelopes: Vec::new(),
+            },
+        );
+    }
+
+    assert_eq!(
+        remove_pending_initialize_for_connection_locked(&mut remote, 11),
+        1
+    );
+    let client = remote.clients.get("default:unknown").expect("client");
+    assert!(!client.pending.contains_key("1"));
+    assert!(client.pending.contains_key("2"));
+    assert!(client.pending.contains_key("3"));
+}
+
+#[test]
+fn source_migration_keeps_connection_client_when_target_key_exists() {
+    let mut remote = remote_inner_for_test("stream-root");
+    remote.connections.insert(
+        "known".to_string(),
+        test_connection(
+            "known",
+            11,
+            true,
+            true,
+            crate::app_state::RemoteControlSourceKind::CodexApp,
+            None,
+        ),
+    );
+    remote.connections.insert(
+        "unknown".to_string(),
+        test_connection(
+            "unknown",
+            12,
+            true,
+            false,
+            crate::app_state::RemoteControlSourceKind::Unknown,
+            None,
+        ),
+    );
+    ensure_client_state_locked(&mut remote, "default:codex_app");
+    let unknown_client = ensure_client_state_locked(&mut remote, "default:unknown");
+    let client_id = unknown_client.client_id.clone();
+    let stream_id = unknown_client.stream_id.clone();
+
+    let resolved = migrate_source_default_client_key_locked(
+        &mut remote,
+        12,
+        "default:unknown",
+        crate::app_state::RemoteControlSourceKind::CodexApp,
+        &client_id,
+        &stream_id,
+    );
+
+    assert_eq!(resolved, "default:unknown");
+    assert!(remote.clients.contains_key("default:codex_app"));
+    assert!(remote.clients.contains_key("default:unknown"));
+    assert_eq!(
+        remote
+            .connections
+            .get("unknown")
+            .map(|connection| connection.default_client_key.as_str()),
+        Some("default:unknown")
+    );
+}
+
+#[test]
+fn virtual_remote_client_routes_through_active_connection() {
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut remote = remote_inner_for_test("stream-root");
+    remote.connections.insert(
+        "active".to_string(),
+        test_connection(
+            "active",
+            11,
+            true,
+            true,
+            crate::app_state::RemoteControlSourceKind::CodexApp,
+            Some(outbound_tx),
+        ),
+    );
+    ensure_client_state_locked(&mut remote, "wechat:bot:user-1");
+
+    assert_eq!(
+        connection_epoch_for_client_key_locked(&mut remote, "wechat:bot:user-1"),
+        Some(11)
+    );
 }
 
 #[tokio::test]
@@ -893,6 +1005,147 @@ async fn initialize_remote_clients_for_connection_sends_connection_default_clien
     assert_eq!(initialize_streams, expected_streams);
 }
 
+#[tokio::test]
+async fn initialize_remote_clients_for_connection_does_not_share_pending_initialize_across_epochs()
+{
+    let state = test_state();
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut remote = state.remote_control.inner.lock().await;
+        remote.connected = true;
+        remote.stream_id = "stream-root".to_string();
+        remote.connections.insert(
+            "first".to_string(),
+            test_connection(
+                "first",
+                11,
+                true,
+                false,
+                crate::app_state::RemoteControlSourceKind::Unknown,
+                Some(first_tx),
+            ),
+        );
+        remote.connections.insert(
+            "second".to_string(),
+            test_connection(
+                "second",
+                12,
+                true,
+                false,
+                crate::app_state::RemoteControlSourceKind::Unknown,
+                Some(second_tx),
+            ),
+        );
+    }
+
+    initialize_remote_clients_for_connection(&state, 11)
+        .await
+        .expect("initialize first unknown connection");
+    let first_envelopes = take_text_envelopes(&mut first_rx);
+    let first_initialize = first_envelopes
+        .iter()
+        .find(|envelope| envelope_message_method(envelope) == Some("initialize"))
+        .expect("first initialize");
+    let first_request_id = first_initialize["message"]["id"].clone();
+    let client_id = first_initialize["client_id"]
+        .as_str()
+        .expect("first client id")
+        .to_string();
+    let stream_id = first_initialize["stream_id"]
+        .as_str()
+        .expect("first stream id")
+        .to_string();
+    assert_eq!(
+        first_envelopes
+            .iter()
+            .filter(|envelope| envelope_message_method(envelope) == Some("initialize"))
+            .count(),
+        1
+    );
+
+    initialize_remote_clients_for_connection(&state, 12)
+        .await
+        .expect("initialize second unknown connection");
+    let second_envelopes = take_text_envelopes(&mut second_rx);
+    let second_initialize = second_envelopes
+        .iter()
+        .find(|envelope| envelope_message_method(envelope) == Some("initialize"))
+        .expect("second initialize");
+    let second_request_id = second_initialize["message"]["id"].clone();
+    assert_eq!(second_initialize["client_id"], client_id);
+    assert_eq!(second_initialize["stream_id"], stream_id);
+    assert_eq!(
+        second_envelopes
+            .iter()
+            .filter(|envelope| envelope_message_method(envelope) == Some("initialize"))
+            .count(),
+        1
+    );
+
+    observe_app_server_message(
+        &state,
+        11,
+        &client_id,
+        &stream_id,
+        &json!({
+            "id": first_request_id,
+            "result": {"userAgent": "Codex Desktop/1.0"}
+        }),
+    )
+    .await;
+    observe_app_server_message(
+        &state,
+        12,
+        &client_id,
+        &stream_id,
+        &json!({
+            "id": second_request_id,
+            "result": {"userAgent": "codex_vscode/1.0"}
+        }),
+    )
+    .await;
+
+    let snapshot = status_snapshot(&state).await;
+    assert_eq!(snapshot.connections.len(), 2);
+    assert!(
+        snapshot
+            .connections
+            .iter()
+            .all(|connection| connection.initialized && connection.healthy)
+    );
+    let mut remote = state.remote_control.inner.lock().await;
+    assert_eq!(
+        connection_epoch_for_client_key_locked(&mut remote, "default:codex_app"),
+        Some(11)
+    );
+    assert_eq!(
+        connection_epoch_for_client_key_locked(&mut remote, "default:vscode"),
+        Some(12)
+    );
+    assert_eq!(
+        resolve_remote_client_key_for_connection_locked(&remote, 11, "default:codex_app"),
+        "default:unknown"
+    );
+    assert_eq!(
+        resolve_remote_client_key_for_connection_locked(&remote, 12, "default:vscode"),
+        "default:unknown"
+    );
+    assert_eq!(remote.clients.len(), 1);
+    assert!(
+        remote
+            .clients
+            .get("default:unknown")
+            .is_some_and(|client| client.pending.is_empty())
+    );
+    assert!(
+        remote
+            .connections
+            .values()
+            .all(|connection| connection.default_client_key == "default:unknown")
+    );
+}
+
 #[test]
 fn active_connection_can_be_selected_before_initialize_completes() {
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1122,6 +1375,98 @@ async fn status_snapshot_excludes_inactive_connections() {
             .map(|connection| connection.id.as_str()),
         Some("conn-active")
     );
+}
+
+#[tokio::test]
+async fn session_history_falls_back_to_another_connection_and_uses_fast_root_sources() {
+    let state = test_state();
+    let (failed_tx, failed_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(failed_rx);
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut remote = state.remote_control.inner.lock().await;
+        remote.stream_id = "stream-root".to_string();
+        for client_key in ["default:codex_app", "default:vscode"] {
+            ensure_client_state_locked(&mut remote, client_key).initialized = true;
+        }
+        remote.connections.insert(
+            "conn-codex-failed".to_string(),
+            test_connection(
+                "conn-codex-failed",
+                20,
+                true,
+                true,
+                crate::app_state::RemoteControlSourceKind::CodexApp,
+                Some(failed_tx),
+            ),
+        );
+        remote.connections.insert(
+            "conn-vscode-ready".to_string(),
+            test_connection(
+                "conn-vscode-ready",
+                10,
+                true,
+                true,
+                crate::app_state::RemoteControlSourceKind::Vscode,
+                Some(ready_tx),
+            ),
+        );
+        sync_legacy_from_active_connection_locked(&mut remote);
+    }
+
+    let request_state = state.clone();
+    let request = tokio::spawn(async move {
+        session_history_threads(&request_state, DEFAULT_REMOTE_CLIENT_KEY, 100, 20, false).await
+    });
+    let envelope = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(OutboundWsMessage::Text(envelope)) = ready_rx.recv().await
+                && envelope_message_method(&envelope) == Some("thread/list")
+            {
+                return envelope;
+            }
+        }
+    })
+    .await
+    .expect("thread/list should fall back to the ready connection");
+
+    assert_eq!(
+        envelope["message"]["params"]["sourceKinds"],
+        json!(["cli", "vscode"])
+    );
+    assert_eq!(envelope["message"]["params"]["useStateDbOnly"], true);
+    assert_eq!(envelope["message"]["params"]["modelProviders"], json!([]));
+    assert_eq!(envelope["message"]["params"]["limit"], 100);
+
+    let client_id = envelope["client_id"]
+        .as_str()
+        .expect("client id")
+        .to_string();
+    let stream_id = envelope["stream_id"]
+        .as_str()
+        .expect("stream id")
+        .to_string();
+    let request_id = envelope["message"]["id"].clone();
+    observe_app_server_message(
+        &state,
+        10,
+        &client_id,
+        &stream_id,
+        &json!({
+            "id": request_id,
+            "result": {
+                "data": [{"id": "thread-1"}],
+                "nextCursor": null
+            }
+        }),
+    )
+    .await;
+
+    let threads = request
+        .await
+        .expect("session history task")
+        .expect("session history response");
+    assert_eq!(threads, vec![json!({"id": "thread-1"})]);
 }
 
 #[tokio::test]

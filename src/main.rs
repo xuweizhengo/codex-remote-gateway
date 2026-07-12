@@ -1,4 +1,4 @@
-﻿#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 
 mod ai_gateway;
 mod app_state;
@@ -9,11 +9,13 @@ mod codex;
 mod codex_app_config;
 mod codex_session_history;
 mod config;
+mod daemon_process;
 mod diagnostics_export;
 #[cfg(feature = "gui")]
 mod gui;
 mod im;
 mod im_runtime;
+mod outbound_http;
 mod remote_control_backend;
 mod store;
 mod types;
@@ -147,11 +149,19 @@ fn run_gui_command() -> anyhow::Result<()> {
 }
 
 async fn run_daemon(config_path: PathBuf, config: AppConfig) -> anyhow::Result<()> {
+    let daemon_identity = daemon_process::DaemonIdentity::new();
+    let _daemon_lock = daemon_process::DaemonInstanceLock::acquire(&config_path, &daemon_identity)?;
     let bind = config.bind.clone();
+    outbound_http::init(&config.outbound_proxy, config.local_listen_port())?;
     let chain_log_path = chain_log_path(&config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
-    let state = AppState::new(config_path, config, Some(shutdown_tx));
+    let state = AppState::new(
+        config_path,
+        config,
+        Some(shutdown_tx),
+        Some(daemon_identity),
+    );
     {
         let config = state.config.lock().await;
         state
@@ -578,6 +588,11 @@ fn normalize_config_paths(config: &mut AppConfig, config_path: &Path) {
     if config.state_path.is_relative() {
         config.state_path = base.join(&config.state_path);
     }
+    if let Some(log_dir) = config.logging.log_dir.as_mut()
+        && log_dir.is_relative()
+    {
+        *log_dir = base.join(&log_dir);
+    }
 }
 
 fn init_logging(config: &AppConfig) -> anyhow::Result<PathBuf> {
@@ -605,6 +620,11 @@ fn chain_log_path(config: &AppConfig) -> PathBuf {
 }
 
 fn log_dir_from_config(config: &AppConfig) -> PathBuf {
+    if let Some(log_dir) = &config.logging.log_dir
+        && !log_dir.as_os_str().is_empty()
+    {
+        return log_dir.clone();
+    }
     config
         .state_path
         .parent()

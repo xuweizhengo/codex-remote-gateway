@@ -188,6 +188,87 @@ impl GuiText {
         }
     }
 
+    pub(super) fn network_menu(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "网络",
+            GuiLocale::EnUs => "&Network",
+        }
+    }
+
+    pub(super) fn outbound_proxy_system(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "跟随系统代理",
+            GuiLocale::EnUs => "Use System Proxy",
+        }
+    }
+
+    pub(super) fn outbound_proxy_system_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "CodexHub 访问外部 API 时跟随系统代理设置",
+            GuiLocale::EnUs => "Use the system proxy for CodexHub external API requests",
+        }
+    }
+
+    pub(super) fn outbound_proxy_direct(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "强制直连",
+            GuiLocale::EnUs => "Direct Connection",
+        }
+    }
+
+    pub(super) fn outbound_proxy_direct_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "CodexHub 访问外部 API 时不使用任何代理",
+            GuiLocale::EnUs => "Do not use a proxy for CodexHub external API requests",
+        }
+    }
+
+    pub(super) fn outbound_proxy_custom(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "自定义 HTTP/SOCKS5 代理...",
+            GuiLocale::EnUs => "Custom HTTP/SOCKS5 Proxy...",
+        }
+    }
+
+    pub(super) fn outbound_proxy_custom_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "指定 CodexHub 自身使用的出站代理",
+            GuiLocale::EnUs => "Set an explicit outbound proxy for CodexHub",
+        }
+    }
+
+    pub(super) fn outbound_proxy_prompt(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                "输入代理 URL，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+            }
+            GuiLocale::EnUs => {
+                "Enter a proxy URL, such as http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
+            }
+        }
+    }
+
+    pub(super) fn outbound_proxy_restart_message(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "出站代理设置已保存，重启 CodexHub 后生效。",
+            GuiLocale::EnUs => "Outbound proxy saved. Restart CodexHub to apply it.",
+        }
+    }
+
+    pub(super) fn outbound_proxy_applied_message(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "出站代理设置已保存并立即生效。",
+            GuiLocale::EnUs => "Outbound proxy saved and applied.",
+        }
+    }
+
+    pub(super) fn outbound_proxy_save_failed(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "出站代理设置保存失败",
+            GuiLocale::EnUs => "Failed to save outbound proxy setting",
+        }
+    }
+
     pub(super) fn help_menu(self) -> &'static str {
         match self.locale {
             GuiLocale::ZhCn => "帮助",
@@ -489,9 +570,11 @@ impl GuiText {
 
     pub(super) fn image_generation_feature_help(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => "勾选后，大模型接入会从 Codex 请求中移除 image_generation 工具。",
+            GuiLocale::ZhCn => {
+                "勾选后，AI Gateway 会从 Codex 请求中移除 image_generation 和 image_gen 生图工具。"
+            }
             GuiLocale::EnUs => {
-                "When checked, AI Gateway removes image_generation tools from Codex requests."
+                "When checked, AI Gateway removes image_generation and image_gen tools from Codex requests."
             }
         }
     }
@@ -2480,6 +2563,35 @@ impl GuiText {
         match self.locale {
             GuiLocale::ZhCn => format!("无法启动本地服务：{err}"),
             GuiLocale::EnUs => format!("Failed to start the local service: {err}"),
+        }
+    }
+
+    pub(super) fn daemon_port_unknown(self, base_url: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => format!("无法识别本地服务地址的端口：{base_url}"),
+            GuiLocale::EnUs => format!("Could not determine the local service port: {base_url}"),
+        }
+    }
+
+    pub(super) fn daemon_port_conflict(self, port: u16, owner: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                format!("端口 {port} 被非 CodexHub 进程占用，已停止自动启动以避免误杀：{owner}")
+            }
+            GuiLocale::EnUs => format!(
+                "Port {port} is owned by a non-CodexHub process. Automatic startup was stopped to avoid terminating it: {owner}"
+            ),
+        }
+    }
+
+    pub(super) fn daemon_stop_failed(self, port: u16, pids: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                format!("无法停止占用端口 {port} 的旧 CodexHub 进程（PID：{pids}）")
+            }
+            GuiLocale::EnUs => {
+                format!("Failed to stop the old CodexHub process on port {port} (PID: {pids})")
+            }
         }
     }
 

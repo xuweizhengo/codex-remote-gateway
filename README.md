@@ -128,6 +128,14 @@ codex --remote ws://127.0.0.1:3849
 
 微信链路依赖客户端下发的 context token。长任务或手机端长时间不活动时，微信客户端可能让 token 过期，导致本地 backend 暂时无法继续发送消息。遇到这种情况，在微信里发送 `!` 或 `?` 可以刷新 token；这两个激活消息只用于恢复发送链路，不会转发给 Codex。
 
+## 网络与代理
+
+CodexHub 的“网络”菜单提供三种出站模式：跟随系统代理、强制直连、自定义 HTTP/SOCKS5 代理。该设置只影响 CodexHub 访问模型服务、微信、Telegram、飞书 HTTP API 和更新地址，不会修改 macOS `launchctl`、Windows 用户环境变量或其它应用的网络设置。
+
+使用 Clash、V2Ray 等本地代理时，可以选择“自定义 HTTP/SOCKS5 代理”，填写 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`。daemon 正在运行时设置会立即生效。本地 GUI、Codex App、VS Code 与 CodexHub 之间的回环通信不会使用这个出站代理。
+
+TUN / Network Extension 类型的 VPN 工作在 HTTP 代理层以下。如果它拦截回环流量，仍需要在 VPN 软件中排除 `localhost`、`127.0.0.1` 和 `::1`。
+
 ## AI Gateway
 
 AI Gateway 解决的是“Codex 只认原生模型入口，但用户想用更多模型渠道”的问题。你在 GUI 里配置渠道后，Codex App 看到的仍然是普通模型列表；真正的上游请求由 `codexhub` 负责转发和转换。
@@ -144,6 +152,12 @@ AI Gateway 解决的是“Codex 只认原生模型入口，但用户想用更多
 - 过滤生图工具：默认关闭；打开后 AI Gateway 会从请求中移除 Codex 的 `image_generation` 工具，适合不支持生图工具的渠道。
 
 这些能力都在 GUI 中操作，不需要用户手写配置文件。
+
+## 日志目录与清理
+
+Windows 正常运行时，配置文件默认在 `%LOCALAPPDATA%\CodexHub\config.toml`，链路日志默认写到 `%LOCALAPPDATA%\CodexHub\logs\codexhub-chain.log`。如果用 `--config` 指定了配置文件，默认日志目录会跟随该配置文件所在目录下的 `logs`。
+
+在 GUI 的“设置 / 日志与诊断”里可以查看当前日志目录和日志文件，也可以保存自定义日志目录。目录改动会写入 `logging.logDir`，重启本地服务后生效。这里也提供“清理日志”，会清理链路日志和 AI Gateway 请求日志。
 
 ## 交流与支持
 
@@ -227,6 +241,20 @@ Thread 绑定模型：
 cargo fmt
 cargo test
 cargo build --release --features gui --bin codexhub
+```
+
+Electron GUI 位于 `electron-ui/`，Rust 核心仍然通过 `daemon` 命令运行。开发时可以用下面的方式启动新界面：
+
+```powershell
+cd electron-ui
+npm install
+npm run dev
+```
+
+也可以从 Rust 入口启动 Electron GUI：
+
+```powershell
+cargo run --features gui -- gui
 ```
 
 daemon 运行时常用状态接口：

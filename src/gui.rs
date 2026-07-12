@@ -28,32 +28,33 @@ use crate::ai_gateway::config::{
     DEFAULT_PROVIDER_TIMEOUT_SECS, ProviderConfig, ProviderType, provider_api_root,
     provider_display_base_url,
 };
-use crate::config::{AppConfig, LocalConnectionMode};
+use crate::config::{AppConfig, LocalConnectionMode, OutboundProxyConfig, OutboundProxyMode};
 use crate::diagnostics_export::{
     ConnectionDiagnosticsInput, connection_status_snapshot, export_connection_diagnostics_to_path,
 };
+use crate::types::now_ms;
 
 #[cfg(target_os = "windows")]
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3847";
 #[cfg(not(target_os = "windows"))]
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3847";
 const CODEX_APP_GUI_UNSUPPORTED: bool = !(cfg!(target_os = "macos") || cfg!(target_os = "windows"));
-const PROJECT_HOME_URL: &str = "https://github.com/happy-loki/codexhub";
+const PROJECT_HOME_URL: &str = "https://github.com/xuweizhengo/codexhub";
 #[cfg(target_os = "windows")]
 const UPDATE_MANIFEST_URL: &str =
-    "https://github.com/happy-loki/codexhub/releases/latest/download/latest-windows.json";
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest-windows.json";
 const MACOS_UPDATE_MANIFEST_URL: &str =
-    "https://github.com/happy-loki/codexhub/releases/latest/download/latest-macos.json";
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest-macos.json";
 #[cfg(target_os = "macos")]
 const UPDATE_MANIFEST_URL: &str = MACOS_UPDATE_MANIFEST_URL;
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 const UPDATE_MANIFEST_URL: &str =
-    "https://github.com/happy-loki/codexhub/releases/latest/download/latest-linux.json";
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest-linux.json";
 const LEGACY_UPDATE_MANIFEST_URL: &str =
-    "https://github.com/happy-loki/codexhub/releases/latest/download/latest.json";
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest.json";
 const UPDATE_RELEASE_API_URL: &str =
-    "https://api.github.com/repos/happy-loki/codexhub/releases/latest";
-const UPDATE_RELEASE_PAGE_URL: &str = "https://github.com/happy-loki/codexhub/releases/latest";
+    "https://api.github.com/repos/xuweizhengo/codexhub/releases/latest";
+const UPDATE_RELEASE_PAGE_URL: &str = "https://github.com/xuweizhengo/codexhub/releases/latest";
 const DASHBOARD_REFRESH_INTERVAL_MS: i32 = 10_000;
 const REQUEST_LOG_REFRESH_INTERVAL_MS: i32 = 5_000;
 const REQUEST_LOG_TAB_INDEX: i32 = 3;
@@ -65,6 +66,8 @@ const GUI_STATUS_TIMEOUT: Duration = Duration::from_millis(650);
 const GUI_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const GUI_CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
 const GUI_STARTUP_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_AUTO_RESTART_FAILURE_THRESHOLD: u64 = 3;
+const DAEMON_AUTO_RESTART_COOLDOWN_MS: u64 = 60_000;
 const GUI_MODEL_LIST_FETCH_TIMEOUT_SECS: u64 = 30;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "windows")]
@@ -80,6 +83,9 @@ const ID_MENU_THEME_DARK: i32 = 10_008;
 const ID_SERVICE_CONNECTION_SWITCH: i32 = 10_009;
 const ID_MENU_QUIT: i32 = 10_010;
 const ID_MENU_EXPORT_CONNECTION_DIAGNOSTICS: i32 = 10_011;
+const ID_MENU_PROXY_SYSTEM: i32 = 10_012;
+const ID_MENU_PROXY_DIRECT: i32 = 10_013;
+const ID_MENU_PROXY_CUSTOM: i32 = 10_014;
 
 type ImAccountRows = Rc<RefCell<Vec<[String; 5]>>>;
 type ImAccountModel = Rc<RefCell<CustomDataViewVirtualListModel>>;
@@ -311,6 +317,7 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         &frame,
         &gui_timers,
         text,
+        api.clone(),
         update_check_in_flight.clone(),
         quitting.clone(),
         gui_tx.clone(),
@@ -1611,6 +1618,8 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let handles = handles.clone();
         let frame = frame;
         let dashboard_refresh = dashboard_refresh.clone();
+        let daemon_child_for_idle = daemon_child.clone();
+        let gui_timers_for_idle = gui_timers.clone();
         let gui_tx = gui_tx.clone();
         let im_action_in_flight = im_action_in_flight.clone();
         let ai_gw_action_in_flight = ai_gw_action_in_flight.clone();
@@ -1695,7 +1704,14 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
                                 apply_pending_ai_gw_action(&handles, &frame, result);
                             }
                             GuiMessage::DashboardUpdate => {
-                                apply_pending_dashboard(&handles, &dashboard_refresh, &api, &frame);
+                                apply_pending_dashboard(
+                                    &handles,
+                                    &dashboard_refresh,
+                                    &api,
+                                    &frame,
+                                    &daemon_child_for_idle,
+                                    &gui_timers_for_idle,
+                                );
                             }
                             GuiMessage::DiagnosticsExport => {
                                 apply_pending_diagnostics_export(
@@ -1934,6 +1950,47 @@ fn save_gui_theme(mode: ThemeMode) -> Result<(), String> {
     config.save(&path).map_err(|err| err.to_string())
 }
 
+fn load_outbound_proxy_config() -> OutboundProxyConfig {
+    daemon_config_path()
+        .and_then(|path| AppConfig::load_or_default(&path).ok())
+        .map(|config| config.outbound_proxy)
+        .unwrap_or_default()
+}
+
+fn save_outbound_proxy_config(
+    api: &ApiClient,
+    outbound_proxy: OutboundProxyConfig,
+) -> Result<bool, String> {
+    if let Ok(mut config) = api.get_app_config() {
+        crate::outbound_http::validate_for_local_port(&outbound_proxy, config.local_listen_port())
+            .map_err(|err| err.to_string())?;
+        config.outbound_proxy = outbound_proxy;
+        api.save_app_config(&config)?;
+        return Ok(true);
+    }
+
+    let path = daemon_config_path().unwrap_or_else(app_support_config_path);
+    let mut config = AppConfig::load_or_default(&path).map_err(|err| err.to_string())?;
+    crate::outbound_http::validate_for_local_port(&outbound_proxy, config.local_listen_port())
+        .map_err(|err| err.to_string())?;
+    config.outbound_proxy = outbound_proxy;
+    config.save(&path).map_err(|err| err.to_string())?;
+    Ok(false)
+}
+
+fn apply_outbound_blocking_proxy(
+    builder: reqwest::blocking::ClientBuilder,
+) -> Result<reqwest::blocking::ClientBuilder, String> {
+    let path = daemon_config_path().unwrap_or_else(app_support_config_path);
+    let config = AppConfig::load_or_default(&path).map_err(|err| err.to_string())?;
+    crate::outbound_http::apply_blocking_proxy(
+        builder,
+        &config.outbound_proxy,
+        config.local_listen_port(),
+    )
+    .map_err(|err| err.to_string())
+}
+
 fn export_connection_diagnostics_async(
     text: GuiText,
     gui_tx: tokio_mpsc::UnboundedSender<GuiMessage>,
@@ -2048,6 +2105,7 @@ fn install_system_menu(
     frame: &Frame,
     gui_timers: &GuiTimers,
     text: GuiText,
+    api: ApiClient,
     update_check_in_flight: Arc<AtomicBool>,
     quitting: Rc<AtomicBool>,
     gui_tx: tokio_mpsc::UnboundedSender<GuiMessage>,
@@ -2098,6 +2156,36 @@ fn install_system_menu(
     theme_menu.check_item(ID_MENU_THEME_SYSTEM, theme_mode == ThemeMode::System);
     theme_menu.check_item(ID_MENU_THEME_LIGHT, theme_mode == ThemeMode::Light);
     theme_menu.check_item(ID_MENU_THEME_DARK, theme_mode == ThemeMode::Dark);
+    let outbound_proxy = load_outbound_proxy_config();
+    let network_menu = Menu::builder()
+        .append_radio_item(
+            ID_MENU_PROXY_SYSTEM,
+            text.outbound_proxy_system(),
+            text.outbound_proxy_system_help(),
+        )
+        .append_radio_item(
+            ID_MENU_PROXY_DIRECT,
+            text.outbound_proxy_direct(),
+            text.outbound_proxy_direct_help(),
+        )
+        .append_radio_item(
+            ID_MENU_PROXY_CUSTOM,
+            text.outbound_proxy_custom(),
+            text.outbound_proxy_custom_help(),
+        )
+        .build();
+    network_menu.check_item(
+        ID_MENU_PROXY_SYSTEM,
+        outbound_proxy.mode == OutboundProxyMode::System,
+    );
+    network_menu.check_item(
+        ID_MENU_PROXY_DIRECT,
+        outbound_proxy.mode == OutboundProxyMode::Direct,
+    );
+    network_menu.check_item(
+        ID_MENU_PROXY_CUSTOM,
+        outbound_proxy.mode == OutboundProxyMode::Custom,
+    );
     let help_menu = Menu::builder()
         .append_item(
             ID_MENU_CHECK_UPDATE,
@@ -2116,6 +2204,7 @@ fn install_system_menu(
         .append(file_menu, text.file_menu())
         .append(language_menu, text.language_menu())
         .append(theme_menu, text.theme_menu())
+        .append(network_menu, text.network_menu())
         .append(help_menu, text.help_menu())
         .build();
     frame.set_menu_bar(menu_bar);
@@ -2154,6 +2243,15 @@ fn install_system_menu(
         ID_MENU_THEME_SYSTEM => handle_theme_selected(&frame, text, ThemeMode::System),
         ID_MENU_THEME_LIGHT => handle_theme_selected(&frame, text, ThemeMode::Light),
         ID_MENU_THEME_DARK => handle_theme_selected(&frame, text, ThemeMode::Dark),
+        ID_MENU_PROXY_SYSTEM => {
+            handle_outbound_proxy_selected(&frame, text, &api, OutboundProxyMode::System)
+        }
+        ID_MENU_PROXY_DIRECT => {
+            handle_outbound_proxy_selected(&frame, text, &api, OutboundProxyMode::Direct)
+        }
+        ID_MENU_PROXY_CUSTOM => {
+            handle_outbound_proxy_selected(&frame, text, &api, OutboundProxyMode::Custom)
+        }
         ID_ABOUT => show_about_dialog(&frame),
         _ => event.skip(true),
     });
@@ -3905,11 +4003,13 @@ fn fetch_remote_models(
     timeout_secs: u64,
 ) -> Result<(Vec<String>, String), String> {
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|err| err.to_string())?;
+    let client = apply_outbound_blocking_proxy(
+        reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(5)),
+    )?
+    .build()
+    .map_err(|err| err.to_string())?;
     let mut errors = Vec::new();
     for candidate in model_list_candidates(base_url, models_url, fallback_models_url) {
         let mut request = client.get(&candidate.url);
@@ -4089,6 +4189,67 @@ fn handle_theme_selected(frame: &Frame, text: GuiText, mode: ThemeMode) {
     }
 }
 
+fn handle_outbound_proxy_selected(
+    frame: &Frame,
+    text: GuiText,
+    api: &ApiClient,
+    mode: OutboundProxyMode,
+) {
+    let mut config = load_outbound_proxy_config();
+    let previous_mode = config.mode;
+    if mode == OutboundProxyMode::Custom {
+        let input = TextEntryDialog::builder(
+            frame,
+            text.outbound_proxy_prompt(),
+            text.outbound_proxy_custom(),
+        )
+        .with_default_value(&config.url)
+        .with_style(
+            TextEntryDialogStyle::Ok | TextEntryDialogStyle::Cancel | TextEntryDialogStyle::Centre,
+        )
+        .build();
+        if input.show_modal() != ID_OK {
+            sync_outbound_proxy_menu(frame, previous_mode);
+            return;
+        }
+        let Some(value) = input.get_value() else {
+            sync_outbound_proxy_menu(frame, previous_mode);
+            return;
+        };
+        config.url = value.trim().to_string();
+    }
+    config.mode = mode;
+
+    match save_outbound_proxy_config(api, config) {
+        Ok(applied_live) => {
+            sync_outbound_proxy_menu(frame, mode);
+            show_info(
+                frame,
+                if applied_live {
+                    text.outbound_proxy_applied_message()
+                } else {
+                    text.outbound_proxy_restart_message()
+                },
+            );
+        }
+        Err(err) => {
+            sync_outbound_proxy_menu(frame, previous_mode);
+            show_error(
+                frame,
+                &format!("{}: {err}", text.outbound_proxy_save_failed()),
+            );
+        }
+    }
+}
+
+fn sync_outbound_proxy_menu(frame: &Frame, mode: OutboundProxyMode) {
+    if let Some(menu_bar) = frame.get_menu_bar() {
+        menu_bar.check_item(ID_MENU_PROXY_SYSTEM, mode == OutboundProxyMode::System);
+        menu_bar.check_item(ID_MENU_PROXY_DIRECT, mode == OutboundProxyMode::Direct);
+        menu_bar.check_item(ID_MENU_PROXY_CUSTOM, mode == OutboundProxyMode::Custom);
+    }
+}
+
 fn bind_service_connection_settings(frame: &Frame, handles: &UiHandles) {
     let button = handles.service_settings_button;
     let text = handles.text;
@@ -4178,6 +4339,8 @@ struct DashboardRefresh {
     result: Arc<Mutex<Option<(u64, DashboardSnapshot)>>>,
     last_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
     daemon_starting: Arc<AtomicBool>,
+    daemon_health_failures: Arc<AtomicU64>,
+    daemon_restart_not_before_ms: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     closing: Arc<AtomicBool>,
     connection_prompt_shown: Arc<AtomicBool>,
@@ -4193,6 +4356,8 @@ impl DashboardRefresh {
             result: Arc::new(Mutex::new(None)),
             last_snapshot: Arc::new(Mutex::new(None)),
             daemon_starting: Arc::new(AtomicBool::new(false)),
+            daemon_health_failures: Arc::new(AtomicU64::new(0)),
+            daemon_restart_not_before_ms: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
             connection_prompt_shown: Arc::new(AtomicBool::new(false)),
@@ -4358,6 +4523,8 @@ fn apply_pending_dashboard(
     refresh: &DashboardRefresh,
     api: &ApiClient,
     frame: &Frame,
+    daemon_child: &Rc<RefCell<Option<Child>>>,
+    gui_timers: &GuiTimers,
 ) -> bool {
     let result = refresh.result.lock().ok().and_then(|mut slot| slot.take());
     let Some((generation, snapshot)) = result else {
@@ -4370,10 +4537,80 @@ fn apply_pending_dashboard(
     let daemon_starting = refresh.daemon_starting.load(Ordering::SeqCst);
     update_dashboard(handles, &snapshot, daemon_starting);
     maybe_prompt_compatible_connection(handles, refresh, api, frame, &snapshot, daemon_starting);
+    maybe_restart_unhealthy_daemon(
+        handles,
+        refresh,
+        api,
+        frame,
+        daemon_child,
+        gui_timers,
+        &snapshot,
+        daemon_starting,
+    );
     if let Ok(mut last_snapshot) = refresh.last_snapshot.lock() {
         last_snapshot.replace(snapshot);
     }
     true
+}
+
+fn maybe_restart_unhealthy_daemon(
+    handles: &UiHandles,
+    refresh: &DashboardRefresh,
+    api: &ApiClient,
+    frame: &Frame,
+    daemon_child: &Rc<RefCell<Option<Child>>>,
+    gui_timers: &GuiTimers,
+    snapshot: &DashboardSnapshot,
+    daemon_starting: bool,
+) {
+    if snapshot.service_online {
+        refresh.daemon_health_failures.store(0, Ordering::SeqCst);
+        return;
+    }
+    if daemon_starting || refresh.closing.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let failures = refresh
+        .daemon_health_failures
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let now = now_ms().min(u64::MAX as u128) as u64;
+    let not_before = refresh.daemon_restart_not_before_ms.load(Ordering::SeqCst);
+    if !daemon_auto_restart_ready(failures, now, not_before) {
+        return;
+    }
+    let next_restart_at = now.saturating_add(DAEMON_AUTO_RESTART_COOLDOWN_MS);
+    if refresh
+        .daemon_restart_not_before_ms
+        .compare_exchange(
+            not_before,
+            next_restart_at,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    refresh.daemon_health_failures.store(0, Ordering::SeqCst);
+    start_daemon_for_gui_async(api, handles, frame, daemon_child, refresh, gui_timers);
+}
+
+fn daemon_auto_restart_ready(failures: u64, now_ms: u64, not_before_ms: u64) -> bool {
+    failures >= DAEMON_AUTO_RESTART_FAILURE_THRESHOLD && now_ms >= not_before_ms
+}
+
+#[cfg(test)]
+mod daemon_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_restart_requires_failure_threshold_and_cooldown() {
+        assert!(!daemon_auto_restart_ready(2, 100, 0));
+        assert!(!daemon_auto_restart_ready(3, 99, 100));
+        assert!(daemon_auto_restart_ready(3, 100, 100));
+    }
 }
 
 fn cached_dashboard_snapshot(refresh: &DashboardRefresh) -> Option<DashboardSnapshot> {
