@@ -110,19 +110,30 @@ pub struct RuntimeState {
     pub pending_approvals_by_conversation: HashMap<String, Vec<PendingApproval>>,
     pub pending_approval_request_keys: HashSet<String>,
     pub feishu_streaming_cards_by_item: HashMap<String, FeishuStreamingCardState>,
+    pub wecom_streams_by_thread: HashMap<String, WecomStreamState>,
     pub thread_routing_requests: HashMap<String, ThreadRoutingRequestState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WecomStreamState {
+    pub req_id: String,
+    pub stream_id: String,
+    pub content: String,
+    pub finished: bool,
 }
 
 impl RuntimeState {
     pub fn start_bridge_generation(&mut self) -> u64 {
         self.bridge_generation = self.bridge_generation.saturating_add(1);
         self.feishu_streaming_cards_by_item.clear();
+        self.wecom_streams_by_thread.clear();
         self.bridge_generation
     }
 
     pub fn invalidate_bridge_generation(&mut self) {
         self.bridge_generation = self.bridge_generation.saturating_add(1);
         self.feishu_streaming_cards_by_item.clear();
+        self.wecom_streams_by_thread.clear();
     }
 
     #[allow(dead_code)]

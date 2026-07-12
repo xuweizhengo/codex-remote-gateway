@@ -540,6 +540,14 @@ pub(crate) async fn handle_codex_notification(
                     .await;
                 return;
             };
+            if route.platform == ImPlatformKind::Wecom {
+                let Some(api) = api_registry.wecom_for_route(&route) else {
+                    log_missing_api(&state, &route, "wecom_agent_delta").await;
+                    return;
+                };
+                send_wecom_stream_delta(&state, &api, thread_id, &route, delta, false).await;
+                return;
+            }
             if route.platform != ImPlatformKind::Feishu {
                 return;
             }
@@ -766,6 +774,16 @@ pub(crate) async fn handle_codex_notification(
                 route.platform,
                 ImPlatformKind::Telegram | ImPlatformKind::Wechat | ImPlatformKind::Wecom
             ) {
+                if route.platform == ImPlatformKind::Wecom && item_type == "agentMessage" {
+                    if let Some(text) = extract_agent_message_text(item) {
+                        let Some(api) = api_registry.wecom_for_route(&route) else {
+                            log_missing_api(&state, &route, "wecom_agent_complete").await;
+                            return;
+                        };
+                        send_wecom_stream_final(&state, &api, thread_id, &route, &text).await;
+                    }
+                    return;
+                }
                 if item_type == "agentMessage"
                     && let Some(text) = extract_agent_message_text(item)
                 {
@@ -941,7 +959,28 @@ pub(crate) async fn handle_codex_notification(
                     .mark_turn_completed(thread_id, turn_id);
                 return;
             };
-            if let Some(text) = extract_turn_reply_text(params) {
+            let wecom_stream_finished = if route.platform == ImPlatformKind::Wecom {
+                let stream = state
+                    .runtime
+                    .lock()
+                    .await
+                    .wecom_streams_by_thread
+                    .get(&route.conversation_key)
+                    .cloned();
+                if let (Some(_stream), Some(api), Some(text)) = (
+                    stream,
+                    api_registry.wecom_for_route(&route),
+                    extract_turn_reply_text(params),
+                ) {
+                    send_wecom_stream_final(&state, &api, thread_id, &route, &text).await;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !wecom_stream_finished && let Some(text) = extract_turn_reply_text(params) {
                 send_turn_reply(
                     &state,
                     &api_registry,
@@ -961,6 +1000,90 @@ pub(crate) async fn handle_codex_notification(
         }
         _ => {}
     }
+}
+
+async fn send_wecom_stream_delta(
+    state: &SharedState,
+    api: &crate::im::wecom::WecomApi,
+    thread_id: &str,
+    route: &RouteTarget,
+    delta: &str,
+    finish: bool,
+) {
+    let key = route.conversation_key.clone();
+    let snapshot = {
+        let mut runtime = state.runtime.lock().await;
+        let Some(mut stream) = runtime.wecom_streams_by_thread.remove(&key) else {
+            return;
+        };
+        stream.content.push_str(delta);
+        stream.finished = finish;
+        let snapshot = stream.clone();
+        runtime.wecom_streams_by_thread.insert(key, stream);
+        snapshot
+    };
+    let content = truncate_utf8_bytes(&snapshot.content, 20 * 1024);
+    if let Err(err) = api
+        .reply_stream(
+            &snapshot.req_id,
+            &snapshot.stream_id,
+            &content,
+            snapshot.finished,
+        )
+        .await
+    {
+        state
+            .push_event(
+                "warn",
+                "wecom_stream_failed",
+                format!("thread={thread_id} chat={} err={err}", route.chat_id),
+            )
+            .await;
+    }
+}
+
+async fn send_wecom_stream_final(
+    state: &SharedState,
+    api: &crate::im::wecom::WecomApi,
+    thread_id: &str,
+    route: &RouteTarget,
+    final_text: &str,
+) {
+    let key = route.conversation_key.clone();
+    let snapshot = state
+        .runtime
+        .lock()
+        .await
+        .wecom_streams_by_thread
+        .remove(&key);
+    let Some(mut stream) = snapshot else {
+        return;
+    };
+    stream.content = final_text.to_string();
+    let content = truncate_utf8_bytes(&stream.content, 20 * 1024);
+    if let Err(err) = api
+        .reply_stream(&stream.req_id, &stream.stream_id, &content, true)
+        .await
+    {
+        state
+            .push_event(
+                "warn",
+                "wecom_stream_final_failed",
+                format!("thread={thread_id} chat={} err={err}", route.chat_id),
+            )
+            .await;
+    }
+}
+
+fn truncate_utf8_bytes(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 async fn route_for_codex_output(

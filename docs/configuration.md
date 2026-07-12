@@ -183,7 +183,7 @@ allowedUserIds = []
 allowedChatIds = []
 ```
 
-The GUI QR flow normally writes `botId` and `secret`. CodexHub then subscribes to the official WeCom AI Bot WebSocket and supports direct/group text, final replies, thread routing, and text approvals. Empty allowlists accept all users and chats. Keep `secret` private. Streaming replies, images/files, and template cards are deferred to phase 2.
+The GUI QR flow normally writes `botId` and `secret`. CodexHub then subscribes to the official WeCom AI Bot WebSocket and supports direct/group text, streaming and final replies, initial/history thread routing cards, image/file input and output, and interactive approval template cards. Empty allowlists accept all users and chats. Keep `secret` private.
 
 ## Bridge
 

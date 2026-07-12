@@ -50,9 +50,18 @@ pub enum ThreadRouteDirection {
     Next,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InboundCallbackKind {
+    Message,
+    Welcome,
+    CardEvent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum InboundAction {
+    ThreadRouteOpen,
     ApprovalDecision {
         request_fingerprint: String,
         option_index: usize,
@@ -129,6 +138,10 @@ pub struct InboundMessage {
     pub action: Option<InboundAction>,
     #[serde(default)]
     pub card_message_id: Option<String>,
+    #[serde(default)]
+    pub callback_req_id: Option<String>,
+    #[serde(default)]
+    pub callback_kind: Option<InboundCallbackKind>,
     #[serde(default)]
     pub attachments: Vec<InboundAttachment>,
 }

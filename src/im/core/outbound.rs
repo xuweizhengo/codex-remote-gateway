@@ -208,30 +208,64 @@ async fn send_wecom_outbound(
     message: ImOutboundMessage,
 ) {
     let adapter = WecomAdapter::new(wecom_api.clone());
-    let text = match &message.payload {
-        ImOutboundPayload::Text(text) => text.clone(),
+    let result = match &message.payload {
+        ImOutboundPayload::Text(text) => {
+            adapter
+                .send_text(
+                    state,
+                    &message.route.account_id,
+                    &message.route.chat_id,
+                    text,
+                )
+                .await
+        }
         ImOutboundPayload::Approval(approval) => {
-            crate::im::wechat::adapter::approval_text(approval, im_text_for_state(state))
+            match adapter
+                .send_approval_card(&message.route.chat_id, approval)
+                .await
+            {
+                Ok(message_id) => Ok(message_id),
+                Err(card_err) => {
+                    let text = crate::im::wechat::adapter::approval_text(
+                        approval,
+                        im_text_for_state(state),
+                    );
+                    adapter
+                        .send_text(
+                            state,
+                            &message.route.account_id,
+                            &message.route.chat_id,
+                            &text,
+                        )
+                        .await
+                        .map_err(|text_err| anyhow!("card={card_err}; fallback={text_err}"))
+                }
+            }
         }
         ImOutboundPayload::Image {
+            path,
             caption,
             fallback_text,
-            ..
-        } => fallback_text
-            .clone()
-            .or_else(|| caption.clone())
-            .unwrap_or_else(|| "[暂不支持图片或文件消息]".to_string()),
+        } => match adapter.send_media(&message.route.chat_id, path).await {
+            Ok(message_id) => Ok(message_id),
+            Err(media_err) => {
+                let fallback = fallback_text
+                    .as_deref()
+                    .or(caption.as_deref())
+                    .unwrap_or("附件发送失败");
+                adapter
+                    .send_text(
+                        state,
+                        &message.route.account_id,
+                        &message.route.chat_id,
+                        fallback,
+                    )
+                    .await
+                    .map_err(|text_err| anyhow!("media={media_err}; fallback={text_err}"))
+            }
+        },
     };
-    log_outbound_message("send_wecom_text_begin", &message, Some(&text));
-    match adapter
-        .send_text(
-            state,
-            &message.route.account_id,
-            &message.route.chat_id,
-            &text,
-        )
-        .await
-    {
+    match result {
         Ok(message_id) => {
             log_outbound_result("send_wecom_text_done", &message, &message_id);
             state

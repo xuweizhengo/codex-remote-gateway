@@ -65,7 +65,7 @@ Open the `消息接入` page and choose one channel:
 - Feishu: click `扫码使用新机器人` and complete QR onboarding.
 - Telegram: paste the BotFather token and click `保存并接入`. Telegram currently supports private bot chats only; group chats are ignored.
 - WeChat: click `扫码连接微信` and confirm in WeChat.
-- WeCom: click `添加企业微信机器人` and confirm by scanning with WeCom. Direct/group text, final replies, thread routing, and text approvals are supported.
+- WeCom: click `添加企业微信机器人` and confirm by scanning with WeCom. Direct/group text, streaming and final replies, image/file transfer, initial/history thread selection cards, and interactive approval template cards are supported.
 
 After a channel is connected, the `IM 通道` status panel becomes available. Normal use does not require scanning or entering the token again unless you switch bots.
 
