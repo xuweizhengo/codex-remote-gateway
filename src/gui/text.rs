@@ -188,6 +188,87 @@ impl GuiText {
         }
     }
 
+    pub(super) fn network_menu(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "网络",
+            GuiLocale::EnUs => "&Network",
+        }
+    }
+
+    pub(super) fn outbound_proxy_system(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "跟随系统代理",
+            GuiLocale::EnUs => "Use System Proxy",
+        }
+    }
+
+    pub(super) fn outbound_proxy_system_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "CodexHub 访问外部 API 时跟随系统代理设置",
+            GuiLocale::EnUs => "Use the system proxy for CodexHub external API requests",
+        }
+    }
+
+    pub(super) fn outbound_proxy_direct(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "强制直连",
+            GuiLocale::EnUs => "Direct Connection",
+        }
+    }
+
+    pub(super) fn outbound_proxy_direct_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "CodexHub 访问外部 API 时不使用任何代理",
+            GuiLocale::EnUs => "Do not use a proxy for CodexHub external API requests",
+        }
+    }
+
+    pub(super) fn outbound_proxy_custom(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "自定义 HTTP/SOCKS5 代理...",
+            GuiLocale::EnUs => "Custom HTTP/SOCKS5 Proxy...",
+        }
+    }
+
+    pub(super) fn outbound_proxy_custom_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "指定 CodexHub 自身使用的出站代理",
+            GuiLocale::EnUs => "Set an explicit outbound proxy for CodexHub",
+        }
+    }
+
+    pub(super) fn outbound_proxy_prompt(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                "输入代理 URL，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+            }
+            GuiLocale::EnUs => {
+                "Enter a proxy URL, such as http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
+            }
+        }
+    }
+
+    pub(super) fn outbound_proxy_restart_message(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "出站代理设置已保存，重启 CodexHub 后生效。",
+            GuiLocale::EnUs => "Outbound proxy saved. Restart CodexHub to apply it.",
+        }
+    }
+
+    pub(super) fn outbound_proxy_applied_message(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "出站代理设置已保存并立即生效。",
+            GuiLocale::EnUs => "Outbound proxy saved and applied.",
+        }
+    }
+
+    pub(super) fn outbound_proxy_save_failed(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "出站代理设置保存失败",
+            GuiLocale::EnUs => "Failed to save outbound proxy setting",
+        }
+    }
+
     pub(super) fn help_menu(self) -> &'static str {
         match self.locale {
             GuiLocale::ZhCn => "帮助",
@@ -206,6 +287,24 @@ impl GuiText {
         match self.locale {
             GuiLocale::ZhCn => "检查 GitHub Releases 是否有新版本",
             GuiLocale::EnUs => "Check GitHub Releases for a newer Codex Remote Gateway version",
+        }
+    }
+
+    pub(super) fn export_connection_diagnostics(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "导出连接诊断包",
+            GuiLocale::EnUs => "Export Connection Diagnostics",
+        }
+    }
+
+    pub(super) fn export_connection_diagnostics_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                "导出 Codex / VSCode / CLI 连接状态和最近日志，不包含 AI Gateway 请求日志"
+            }
+            GuiLocale::EnUs => {
+                "Export Codex / VS Code / CLI connection state and recent logs without AI Gateway request logs"
+            }
         }
     }
 
@@ -473,9 +572,11 @@ impl GuiText {
 
     pub(super) fn image_generation_feature_help(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => "勾选后，大模型接入会从 Codex 请求中移除 image_generation 工具。",
+            GuiLocale::ZhCn => {
+                "勾选后，AI Gateway 会从 Codex 请求中移除 image_generation 和 image_gen 生图工具。"
+            }
             GuiLocale::EnUs => {
-                "When checked, AI Gateway removes image_generation tools from Codex requests."
+                "When checked, AI Gateway removes image_generation and image_gen tools from Codex requests."
             }
         }
     }
@@ -873,9 +974,27 @@ impl GuiText {
 
     pub(super) fn enable_request_logging_help(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => "开启后会记录所有大模型接入请求详情，便于调试和分析",
+            GuiLocale::ZhCn => "开启后记录大模型接入请求摘要指标，便于调试和分析",
             GuiLocale::EnUs => {
-                "When enabled, records all AI Gateway request details for debugging and analysis"
+                "When enabled, records AI Gateway request summary metrics for debugging and analysis"
+            }
+        }
+    }
+
+    pub(super) fn enable_request_log_details(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "记录详情",
+            GuiLocale::EnUs => "Record details",
+        }
+    }
+
+    pub(super) fn enable_request_log_details_help(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                "开启后额外保存请求、上游请求、上游 SSE 和响应内容；可能占用更多资源"
+            }
+            GuiLocale::EnUs => {
+                "When enabled, also stores request, upstream request, upstream SSE, and response payloads"
             }
         }
     }
@@ -1364,31 +1483,10 @@ impl GuiText {
         }
     }
 
-    pub(super) fn initializing(self) -> &'static str {
+    pub(super) fn uninitialized_config(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => "初始化中",
-            GuiLocale::EnUs => "Initializing",
-        }
-    }
-
-    pub(super) fn control_not_open(self) -> &'static str {
-        match self.locale {
-            GuiLocale::ZhCn => "未打开控制",
-            GuiLocale::EnUs => "Control Closed",
-        }
-    }
-
-    pub(super) fn not_injected(self) -> &'static str {
-        match self.locale {
-            GuiLocale::ZhCn => "未注入",
-            GuiLocale::EnUs => "Not Injected",
-        }
-    }
-
-    pub(super) fn can_connect(self) -> &'static str {
-        match self.locale {
-            GuiLocale::ZhCn => "可接入",
-            GuiLocale::EnUs => "Ready",
+            GuiLocale::ZhCn => "未初始化配置",
+            GuiLocale::EnUs => "Not Initialized",
         }
     }
 
@@ -1487,7 +1585,7 @@ impl GuiText {
 
     pub(super) fn not_connected(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => "未接入",
+            GuiLocale::ZhCn => "未连接",
             GuiLocale::EnUs => "Not Connected",
         }
     }
@@ -1692,6 +1790,27 @@ impl GuiText {
         }
     }
 
+    pub(super) fn diagnostics_export_save_dialog_title(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "保存连接诊断包",
+            GuiLocale::EnUs => "Save Connection Diagnostics",
+        }
+    }
+
+    pub(super) fn diagnostics_export_zip_wildcard(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "ZIP 压缩包 (*.zip)|*.zip",
+            GuiLocale::EnUs => "ZIP archives (*.zip)|*.zip",
+        }
+    }
+
+    pub(super) fn diagnostics_export_failed(self, err: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => format!("导出连接诊断包失败：{err}"),
+            GuiLocale::EnUs => format!("Failed to export connection diagnostics: {err}"),
+        }
+    }
+
     pub(super) fn update_dialog_title(self) -> &'static str {
         match self.locale {
             GuiLocale::ZhCn => "Codex Remote Gateway 更新",
@@ -1795,15 +1914,13 @@ impl GuiText {
     ) -> String {
         let action = if can_download_installer {
             match self.locale {
-                GuiLocale::ZhCn => "是否自动下载更新包并启动安装器？",
+                GuiLocale::ZhCn => "是否下载更新包并启动安装器？",
                 GuiLocale::EnUs => "Download and start the installer?",
             }
         } else {
             match self.locale {
-                GuiLocale::ZhCn => "暂时没有找到可自动安装的更新包，是否打开发布页手动下载？",
-                GuiLocale::EnUs => {
-                    "No auto-installable update package was found yet. Open the release page?"
-                }
+                GuiLocale::ZhCn => "是否打开发布页手动下载并安装？",
+                GuiLocale::EnUs => "Open the release page to download and install manually?",
             }
         };
         match self.locale {
@@ -1857,9 +1974,9 @@ impl GuiText {
 
     pub(super) fn update_download_started(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => "正在下载更新包，下载完成后会启动安装器。",
+            GuiLocale::ZhCn => "正在下载更新包，下载完成后会打开安装包。",
             GuiLocale::EnUs => {
-                "Downloading the update. The installer will start when the download finishes."
+                "Downloading the update. The installer package will open when the download finishes."
             }
         }
     }
@@ -1931,11 +2048,34 @@ impl GuiText {
         }
     }
 
-    pub(super) fn update_installer_started(self, path: &str) -> String {
+    #[cfg(target_os = "windows")]
+    pub(super) fn update_installer_started(self) -> &'static str {
         match self.locale {
-            GuiLocale::ZhCn => format!("更新包已下载并启动安装器。\n路径：{path}"),
+            GuiLocale::ZhCn => "更新包已下载。CodexHub 将退出以继续安装。",
             GuiLocale::EnUs => {
-                format!("The update was downloaded and the installer was started.\nPath: {path}")
+                "The update was downloaded. CodexHub will exit to continue installation."
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn update_installer_started(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                "更新包已下载并打开。请将 CodexHub 拖到 Applications 覆盖安装，然后重新打开。"
+            }
+            GuiLocale::EnUs => {
+                "The update was downloaded and opened. Drag CodexHub to Applications to replace the old app, then reopen it."
+            }
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    pub(super) fn update_installer_started(self) -> &'static str {
+        match self.locale {
+            GuiLocale::ZhCn => "更新包已下载并打开，请按系统提示完成安装。",
+            GuiLocale::EnUs => {
+                "The update was downloaded and opened. Follow the system prompts to finish installation."
             }
         }
     }
@@ -2370,6 +2510,35 @@ impl GuiText {
         }
     }
 
+    pub(super) fn daemon_port_unknown(self, base_url: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => format!("无法识别本地服务地址的端口：{base_url}"),
+            GuiLocale::EnUs => format!("Could not determine the local service port: {base_url}"),
+        }
+    }
+
+    pub(super) fn daemon_port_conflict(self, port: u16, owner: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                format!("端口 {port} 被非 CodexHub 进程占用，已停止自动启动以避免误杀：{owner}")
+            }
+            GuiLocale::EnUs => format!(
+                "Port {port} is owned by a non-CodexHub process. Automatic startup was stopped to avoid terminating it: {owner}"
+            ),
+        }
+    }
+
+    pub(super) fn daemon_stop_failed(self, port: u16, pids: &str) -> String {
+        match self.locale {
+            GuiLocale::ZhCn => {
+                format!("无法停止占用端口 {port} 的旧 CodexHub 进程（PID：{pids}）")
+            }
+            GuiLocale::EnUs => {
+                format!("Failed to stop the old CodexHub process on port {port} (PID: {pids})")
+            }
+        }
+    }
+
     pub(super) fn daemon_current_exe_failed(self, err: &str) -> String {
         match self.locale {
             GuiLocale::ZhCn => format!("无法定位当前程序：{err}"),
@@ -2410,10 +2579,10 @@ impl GuiText {
     pub(super) fn ai_gw_channel_editor_help(self) -> &'static str {
         match self.locale {
             GuiLocale::ZhCn => {
-                "选择 OpenAI、DeepSeek、Anthropic 或智谱 GLM，并填写大模型厂商接入信息。"
+                "选择 OpenAI、Grok、DeepSeek、Anthropic 或智谱 GLM，并填写大模型厂商接入信息。"
             }
             GuiLocale::EnUs => {
-                "Choose OpenAI, DeepSeek, Anthropic, or GLM and fill in the channel connection details."
+                "Choose OpenAI, Grok, DeepSeek, Anthropic, or GLM and fill in the channel connection details."
             }
         }
     }
@@ -2483,6 +2652,10 @@ impl GuiText {
 
     pub(super) fn ai_gw_service_openai(self) -> &'static str {
         "OpenAI"
+    }
+
+    pub(super) fn ai_gw_service_grok(self) -> &'static str {
+        "Grok"
     }
 
     pub(super) fn ai_gw_service_deepseek(self) -> &'static str {
@@ -2684,6 +2857,10 @@ impl GuiText {
 
     pub(super) fn provider_type_openai_responses(self) -> &'static str {
         "OpenAI Responses"
+    }
+
+    pub(super) fn provider_type_grok_responses(self) -> &'static str {
+        "Grok Responses"
     }
 
     pub(super) fn provider_type_chat_completions(self) -> &'static str {

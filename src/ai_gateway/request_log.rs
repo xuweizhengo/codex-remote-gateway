@@ -1,4 +1,4 @@
-﻿use std::{
+use std::{
     collections::BTreeMap,
     collections::VecDeque,
     fs,
@@ -15,7 +15,7 @@ use futures_util::Stream;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::AppConfig;
 
@@ -120,6 +120,7 @@ pub struct RequestLogContext {
     pub store: RequestLogStore,
     pub log_id: i64,
     pub started_at: Instant,
+    pub details_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -201,11 +202,20 @@ impl RequestLogStore {
         &self,
         operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
+        let lock_started = Instant::now();
         let mut guard = lock_connection(&self.inner.conn);
+        let lock_wait_ms = elapsed_ms(lock_started);
+        let hold_started = Instant::now();
         if guard.is_none() {
             *guard = Some(open(&self.inner.db_path)?);
         }
-        operation(guard.as_ref().expect("request log connection initialized"))
+        let result = operation(guard.as_ref().expect("request log connection initialized"));
+        debug!(
+            lock_wait_ms,
+            lock_hold_ms = elapsed_ms(hold_started),
+            "ai gateway request log sqlite operation"
+        );
+        result
     }
 }
 
@@ -359,13 +369,28 @@ pub fn elapsed_ms(started_at: Instant) -> i64 {
 }
 
 pub fn headers_to_json(headers: &HeaderMap) -> Option<String> {
+    headers_to_json_with(headers, |_, value| value)
+}
+
+pub fn headers_to_redacted_json(headers: &HeaderMap) -> Option<String> {
+    headers_to_json_with(headers, |name, value| {
+        if is_sensitive_header(name) {
+            "<redacted>".to_string()
+        } else {
+            value
+        }
+    })
+}
+
+fn headers_to_json_with(
+    headers: &HeaderMap,
+    sanitize: impl Fn(&str, String) -> String,
+) -> Option<String> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, value) in headers.iter() {
-        let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
-        grouped
-            .entry(name.as_str().to_string())
-            .or_default()
-            .push(value);
+        let name = name.as_str();
+        let value = sanitize(name, String::from_utf8_lossy(value.as_bytes()).into_owned());
+        grouped.entry(name.to_string()).or_default().push(value);
     }
 
     let mut object = serde_json::Map::new();
@@ -380,6 +405,20 @@ pub fn headers_to_json(headers: &HeaderMap) -> Option<String> {
         }
     }
     serde_json::to_string(&Value::Object(object)).ok()
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api-key"
+            | "x-api-key"
+            | "x-api-secret"
+            | "x-api-token"
+    )
 }
 
 pub fn json_body_size_bytes(value: &Value) -> Option<i64> {
@@ -862,6 +901,9 @@ impl<S> UpstreamSseCaptureStream<S> {
     }
 
     fn capture_chunk(&mut self, chunk: &Bytes) {
+        if !self.context.details_enabled {
+            return;
+        }
         if self.captured.len() >= UPSTREAM_SSE_LOG_LIMIT_BYTES {
             self.truncated = true;
             return;
@@ -876,6 +918,10 @@ impl<S> UpstreamSseCaptureStream<S> {
     }
 
     fn save(&mut self) {
+        if !self.context.details_enabled {
+            self.saved = true;
+            return;
+        }
         if self.saved || self.captured.is_empty() {
             self.saved = true;
             return;
@@ -1204,7 +1250,7 @@ fn observe_sse_chunk(
             usage: Some(usage),
             latency_ms: Some(elapsed_ms(context.started_at)),
             error_message,
-            response_json: Some(compact_json(response)),
+            response_json: context.details_enabled.then(|| compact_json(response)),
             ..RequestLogUpdate::default()
         };
         if let Err(err) = context.store.update_record(context.log_id, &update) {
@@ -1252,6 +1298,14 @@ mod tests {
     }
 
     fn insert_running_test_log(db_path: &Path, request_id: &str) -> RequestLogContext {
+        insert_running_test_log_with_details(db_path, request_id, true)
+    }
+
+    fn insert_running_test_log_with_details(
+        db_path: &Path,
+        request_id: &str,
+        details_enabled: bool,
+    ) -> RequestLogContext {
         let store = test_store(db_path);
         let record = RequestLogRecord {
             request_id: request_id.to_string(),
@@ -1279,6 +1333,7 @@ mod tests {
             store,
             log_id,
             started_at: Instant::now(),
+            details_enabled,
         }
     }
 
@@ -1385,6 +1440,20 @@ mod tests {
         let value: Value = serde_json::from_str(&headers_to_json(&headers).unwrap()).unwrap();
         assert_eq!(value["authorization"], "Bearer local-key");
         assert_eq!(value["x-debug"], json!(["one", "two"]));
+    }
+
+    #[test]
+    fn headers_to_redacted_json_hides_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer provider-key".parse().unwrap());
+        headers.insert("x-api-key", "secret-key".parse().unwrap());
+        headers.insert("x-debug", "visible".parse().unwrap());
+
+        let value: Value =
+            serde_json::from_str(&headers_to_redacted_json(&headers).unwrap()).unwrap();
+        assert_eq!(value["authorization"], "<redacted>");
+        assert_eq!(value["x-api-key"], "<redacted>");
+        assert_eq!(value["x-debug"], "visible");
     }
 
     #[test]
@@ -1639,6 +1708,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn details_disabled_skips_upstream_sse_capture() {
+        let db_path = temp_db_path();
+        let context =
+            insert_running_test_log_with_details(&db_path, "req-upstream-sse-summary-only", false);
+        let inner = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n",
+        ))]);
+        let mut wrapped = UpstreamSseCaptureStream::new(inner, context);
+
+        while let Some(item) = wrapped.next().await {
+            assert!(item.is_ok());
+        }
+        drop(wrapped);
+
+        let detail = get_detail(&db_path, 1).unwrap().unwrap();
+        assert!(detail.upstream_response_sse.is_none());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
     async fn responses_log_stream_records_ttft_for_anthropic_style_events() {
         // Mirrors the exact SSE framing that AnthropicSseToResponsesSse emits:
         // an `event:` line plus a `data:` line whose JSON carries the `type`.
@@ -1666,6 +1755,37 @@ mod tests {
             detail.summary.ttft_ms.is_some(),
             "ttft should be recorded from the first response.*.delta event"
         );
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn details_disabled_keeps_stream_summary_but_skips_response_json() {
+        let db_path = temp_db_path();
+        let context =
+            insert_running_test_log_with_details(&db_path, "req-summary-only-completed", false);
+        let inner = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            )),
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n",
+            )),
+        ]);
+        let mut wrapped = ResponsesSseLogStream::new(inner, context);
+
+        while let Some(item) = wrapped.next().await {
+            assert!(item.is_ok());
+        }
+        drop(wrapped);
+
+        let detail = get_detail(&db_path, 1).unwrap().unwrap();
+        assert_eq!(detail.summary.status, "completed");
+        assert_eq!(detail.summary.input_tokens, Some(2));
+        assert_eq!(detail.summary.output_tokens, Some(3));
+        assert_eq!(detail.summary.total_tokens, Some(5));
+        assert!(detail.summary.ttft_ms.is_some());
+        assert!(detail.summary.latency_ms.is_some());
+        assert!(detail.response_json.is_none());
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -1780,6 +1900,7 @@ mod tests {
             store,
             log_id,
             started_at: Instant::now(),
+            details_enabled: true,
         };
         let mut line_buf = String::new();
         let mut completed = false;

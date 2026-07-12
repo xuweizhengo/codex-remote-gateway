@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::ai_gateway::config::AiGatewayConfig;
 use crate::config::{AppConfig, LocalConnectionMode};
+use crate::daemon_process::DaemonIdentity;
 
 use super::text::GuiText;
 use super::{GUI_ACTION_TIMEOUT, GUI_CONFIG_TIMEOUT, GUI_CONNECT_TIMEOUT, GUI_STATUS_TIMEOUT};
@@ -51,7 +52,19 @@ impl ApiClient {
     }
 
     pub(super) fn is_online(&self) -> bool {
-        self.get_quick::<serde_json::Value>("/api/status").is_ok()
+        self.daemon_identity().is_ok()
+    }
+
+    pub(super) fn daemon_identity(&self) -> Result<DaemonIdentity, String> {
+        let identity = self.get_quick::<DaemonIdentity>("/api/status")?;
+        identity
+            .is_codexhub()
+            .then_some(identity)
+            .ok_or_else(|| "local service identity does not match CodexHub".to_string())
+    }
+
+    pub(super) fn get_quick_json(&self, path: &str) -> Result<Value, String> {
+        self.get_quick(path)
     }
 
     pub(super) fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
@@ -133,34 +146,37 @@ impl ApiClient {
     }
 
     pub(super) fn dashboard(&self) -> DashboardSnapshot {
-        let offline_snapshot = DashboardSnapshot {
-            local_connection_mode: self.connection_mode(),
-            ..DashboardSnapshot::default()
-        };
         let dashboard = match self.get_quick::<GuiDashboardResponse>("/api/gui/dashboard") {
             Ok(dashboard) => dashboard,
             Err(_err) => {
-                if self.connection_mode() == LocalConnectionMode::Standard {
-                    return DashboardSnapshot {
-                        compatible_connection_available: self
-                            .probe_base_url("http://localhost:3847"),
-                        ..offline_snapshot
-                    };
-                }
-                return offline_snapshot;
+                return self.dashboard_fallback();
             }
         };
-        let local_connection_mode = dashboard.status.local_connection_mode;
+        DashboardSnapshot::from_dashboard_response(dashboard)
+    }
 
-        DashboardSnapshot {
-            service_online: true,
-            local_connection_mode,
-            compatible_connection_available: false,
-            remote: Some(dashboard.remote),
-            codex_app: Some(dashboard.codex_app),
-            im_accounts: Some(dashboard.im_accounts),
-            status: Some(dashboard.status),
-            ai_gateway: Some(dashboard.ai_gateway),
+    fn dashboard_fallback(&self) -> DashboardSnapshot {
+        let local_connection_mode = self.connection_mode();
+        match self.get_quick::<ServerStatus>("/api/status") {
+            Ok(status) => {
+                let remote = self
+                    .get_quick::<RemoteControlStatus>("/api/remote-control/status")
+                    .ok();
+                let codex_app = self
+                    .get_quick::<CodexAppStatus>("/api/codex-app/status")
+                    .ok();
+                DashboardSnapshot::from_status_fallback(status, remote, codex_app)
+            }
+            Err(_err) => {
+                let compatible_connection_available = local_connection_mode
+                    == LocalConnectionMode::Standard
+                    && self.probe_base_url("http://localhost:3847");
+                DashboardSnapshot {
+                    local_connection_mode,
+                    compatible_connection_available,
+                    ..DashboardSnapshot::default()
+                }
+            }
         }
     }
 
@@ -182,6 +198,9 @@ impl ApiClient {
             return false;
         };
         response.status().is_success()
+            && response
+                .json::<DaemonIdentity>()
+                .is_ok_and(|identity| identity.is_codexhub())
     }
 
     pub(super) fn configure_codex_app(
@@ -334,6 +353,39 @@ pub(super) struct DashboardSnapshot {
     pub(super) ai_gateway: Option<AiGatewayConfig>,
 }
 
+impl DashboardSnapshot {
+    fn from_dashboard_response(dashboard: GuiDashboardResponse) -> Self {
+        let local_connection_mode = dashboard.status.local_connection_mode;
+        Self {
+            service_online: true,
+            local_connection_mode,
+            compatible_connection_available: false,
+            remote: Some(dashboard.remote),
+            codex_app: Some(dashboard.codex_app),
+            im_accounts: Some(dashboard.im_accounts),
+            status: Some(dashboard.status),
+            ai_gateway: Some(dashboard.ai_gateway),
+        }
+    }
+
+    fn from_status_fallback(
+        status: ServerStatus,
+        remote: Option<RemoteControlStatus>,
+        codex_app: Option<CodexAppStatus>,
+    ) -> Self {
+        let local_connection_mode = status.local_connection_mode;
+        Self {
+            service_online: true,
+            local_connection_mode,
+            compatible_connection_available: false,
+            remote,
+            codex_app,
+            status: Some(status),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GuiDashboardResponse {
@@ -379,6 +431,7 @@ pub(super) struct ImAccountItem {
 #[serde(rename_all = "camelCase")]
 pub(super) struct RemoteControlStatus {
     pub(super) connected: bool,
+    #[allow(dead_code)]
     pub(super) initialized: bool,
     pub(super) active_source_kind: Option<String>,
     #[serde(default)]
@@ -389,6 +442,7 @@ pub(super) struct RemoteControlStatus {
 #[serde(rename_all = "camelCase")]
 pub(super) struct RemoteControlConnectionStatus {
     pub(super) connected: bool,
+    #[allow(dead_code)]
     pub(super) initialized: bool,
     pub(super) source_kind: String,
 }
@@ -461,6 +515,70 @@ pub(super) struct SetCodexAppFastStartupRequest {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_fallback_keeps_service_online() {
+        let snapshot = DashboardSnapshot::from_status_fallback(
+            ServerStatus {
+                bind: "127.0.0.1:3847".to_string(),
+                local_connection_mode: LocalConnectionMode::Standard,
+                codex_app_fast_startup: true,
+            },
+            None,
+            None,
+        );
+
+        assert!(snapshot.service_online);
+        assert_eq!(
+            snapshot.local_connection_mode,
+            LocalConnectionMode::Standard
+        );
+        assert!(snapshot.status.is_some());
+        assert!(snapshot.remote.is_none());
+        assert!(snapshot.codex_app.is_none());
+        assert!(snapshot.im_accounts.is_none());
+        assert!(snapshot.ai_gateway.is_none());
+    }
+
+    #[test]
+    fn status_fallback_keeps_terminal_status_when_available() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: true,
+            active_source_kind: Some("vscode".to_string()),
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: true,
+                source_kind: "vscode".to_string(),
+            }],
+        };
+        let codex_app = CodexAppStatus {
+            configured: true,
+            provider: None,
+            providers: Vec::new(),
+            image_generation_enabled: true,
+        };
+        let snapshot = DashboardSnapshot::from_status_fallback(
+            ServerStatus {
+                bind: "127.0.0.1:3847".to_string(),
+                local_connection_mode: LocalConnectionMode::Standard,
+                codex_app_fast_startup: true,
+            },
+            Some(remote),
+            Some(codex_app),
+        );
+
+        assert!(snapshot.service_online);
+        assert!(snapshot.remote.is_some());
+        assert!(snapshot.codex_app.is_some());
+        assert!(snapshot.im_accounts.is_none());
+        assert!(snapshot.ai_gateway.is_none());
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]

@@ -18,6 +18,7 @@ use crate::{
     chain_log,
     codex::CodexNotification,
     config::AppConfig,
+    daemon_process::DaemonIdentity,
     im_runtime::RuntimeState,
     store::PersistedState,
     types::{EventRecord, ImPlatformKind, now_ms},
@@ -27,8 +28,8 @@ pub type SharedState = Arc<AppState>;
 
 pub struct AppState {
     pub config_path: PathBuf,
+    pub daemon_identity: DaemonIdentity,
     pub config: Mutex<AppConfig>,
-    pub ai_gateway_http_client: reqwest::Client,
     pub ai_gateway_request_logs: RequestLogStore,
     pub ai_gateway_routing: Mutex<GatewayRoutingState>,
     pub persisted: Mutex<PersistedState>,
@@ -98,6 +99,7 @@ pub struct RemoteControlSourceHint {
 pub struct RemoteControlServerConnection {
     pub connection_id: String,
     pub connection_epoch: u64,
+    pub default_client_key: String,
     pub connected: bool,
     pub initialized: bool,
     pub source_kind: RemoteControlSourceKind,
@@ -137,6 +139,7 @@ impl Default for RemoteControlSourceKind {
 }
 
 pub struct PendingRemoteRequest {
+    pub connection_epoch: u64,
     pub method: String,
     pub thread_id: Option<String>,
     pub track_thread_active: bool,
@@ -326,6 +329,7 @@ impl AppState {
         config_path: PathBuf,
         config: AppConfig,
         shutdown_tx: Option<oneshot::Sender<()>>,
+        daemon_identity: Option<DaemonIdentity>,
     ) -> SharedState {
         let persisted = PersistedState::load(&config.state_path);
         let runtime = RuntimeState::default();
@@ -335,8 +339,8 @@ impl AppState {
         let (codex_app_fast_startup_tx, _) = watch::channel(config.codex_app_fast_startup);
         Arc::new(Self {
             config_path,
+            daemon_identity: daemon_identity.unwrap_or_else(DaemonIdentity::new),
             config: Mutex::new(config),
-            ai_gateway_http_client: reqwest::Client::new(),
             ai_gateway_request_logs,
             ai_gateway_routing: Mutex::new(GatewayRoutingState::default()),
             persisted: Mutex::new(persisted),

@@ -207,6 +207,7 @@ pub(super) async fn observe_app_server_message(
                     if let Some(client_key) = client_key.as_deref() {
                         let migrated_client_key = migrate_source_default_client_key_locked(
                             &mut remote,
+                            connection_epoch,
                             client_key,
                             connection_source_kind,
                             client_id,
@@ -313,6 +314,14 @@ pub(super) async fn observe_app_server_message(
         if method == "initialized" {
             {
                 let mut remote = state.remote_control.inner.lock().await;
+                if let Some(connection) = remote
+                    .connections
+                    .values_mut()
+                    .find(|connection| connection.connection_epoch == connection_epoch)
+                {
+                    connection.initialized = true;
+                    connection.last_error = None;
+                }
                 if let Some(client_key) = client_key.as_deref() {
                     if let Some(client) = remote.clients.get_mut(client_key) {
                         client.initialized = true;
@@ -324,6 +333,7 @@ pub(super) async fn observe_app_server_message(
                     }
                 }
                 remote.last_error = None;
+                sync_legacy_from_active_connection_locked(&mut remote);
             }
             state
                 .push_event("info", "remote_control_initialized", "initialized")

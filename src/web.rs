@@ -28,7 +28,7 @@ mod codex_app;
 mod im_api;
 mod oauth;
 mod onboarding;
-mod plugins;
+pub(crate) mod plugins;
 
 pub async fn start_bridge_if_ready(state: &SharedState, event_message: &'static str) -> bool {
     im_api::start_bridge_task(state, im_api::BridgeStartMode::KeepExisting, event_message).await
@@ -198,9 +198,14 @@ async fn access_log(request: Request<Body>, next: Next) -> impl IntoResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusResponse {
+    service: String,
+    pid: u32,
+    instance_id: String,
+    started_at_ms: u64,
     running: bool,
     bind: String,
     local_connection_mode: crate::config::LocalConnectionMode,
+    outbound_proxy_mode: crate::config::OutboundProxyMode,
     codex_app_fast_startup: bool,
     state_path: String,
     feishu_ws: FeishuWsState,
@@ -233,9 +238,14 @@ async fn status_snapshot(state: &SharedState) -> StatusResponse {
         .cloned()
         .collect::<Vec<_>>();
     StatusResponse {
+        service: state.daemon_identity.service.clone(),
+        pid: state.daemon_identity.pid,
+        instance_id: state.daemon_identity.instance_id.clone(),
+        started_at_ms: state.daemon_identity.started_at_ms,
         running,
         bind: config.bind.clone(),
         local_connection_mode: config.local_connection_mode,
+        outbound_proxy_mode: config.outbound_proxy.mode,
         codex_app_fast_startup: config.codex_app_fast_startup,
         state_path: config.state_path.to_string_lossy().to_string(),
         feishu_ws,
@@ -360,7 +370,23 @@ async fn save_config(
     State(state): State<SharedState>,
     Json(config): Json<AppConfig>,
 ) -> impl IntoResponse {
+    if let Err(err) = crate::outbound_http::validate_for_local_port(
+        &config.outbound_proxy,
+        config.local_listen_port(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        );
+    }
     if let Err(err) = config.save(&state.config_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        );
+    }
+    if let Err(err) = crate::outbound_http::init(&config.outbound_proxy, config.local_listen_port())
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),

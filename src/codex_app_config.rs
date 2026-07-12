@@ -2,6 +2,7 @@
 use std::process::Command;
 use std::{
     collections::{HashMap, HashSet},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,11 +27,20 @@ const AI_GATEWAY_PROVIDER_NAME: &str = "ai-gateway";
 const CODEX_API_BASE_URL_ENV: &str = "CODEX_API_BASE_URL";
 const CODEX_API_ENDPOINT_ENV: &str = "CODEX_API_ENDPOINT";
 const CODEX_APP_SERVER_LOGIN_ISSUER_ENV: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
+const NO_PROXY_ENV: &str = "NO_PROXY";
+#[cfg(target_os = "macos")]
+const LOWERCASE_NO_PROXY_ENV: &str = "no_proxy";
 const CODEX_APP_SQLITE_DIR: &str = "sqlite";
 const CODEX_APP_PRIMARY_DB: &str = "codex.db";
 const CODEX_APP_DEV_DB: &str = "codex-dev.db";
+const CODEX_APP_STATE_DB: &str = "state_5.sqlite";
+const CODEX_APP_INSTALLATION_ID: &str = "installation_id";
+const CODEX_APP_SERVER_DAEMON_DIR: &str = "app-server-daemon";
+const CODEX_APP_SERVER_DAEMON_SETTINGS: &str = "settings.json";
 const CODEX_APP_REMOTE_CONTROL_FEATURE: &str = "remote_control";
+const CODEX_APP_REMOTE_CONTROL_SERVER_NAME: &str = "CodexHub";
 const CODEX_MODELS_CACHE_FILE: &str = "models_cache.json";
+const CODEX_CONNECTOR_DIRECTORY_CACHE_DIR: &str = "cache/codex_app_directory";
 const SQLITE_WRITE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const SQLITE_INSPECT_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
 const CODEXHUB_HOME_ENV: &str = "CODEXHUB_HOME";
@@ -38,13 +48,8 @@ const OPENAI_BUNDLED_MARKETPLACE_NAME: &str = "openai-bundled";
 const OPENAI_CURATED_MARKETPLACE_NAME: &str = "openai-curated";
 const CODEXHUB_BUNDLED_REMOTE_ID_PREFIX: &str = "plugins~codexhub-bundled-";
 const REMOTE_PLUGIN_INSTALL_METADATA_FILE: &str = ".codex-remote-plugin-install.json";
-const PLUGIN_BLOCKING_FEATURE_FLAGS: &[&str] = &[
-    "apps",
-    "plugins",
-    "computer_use",
-    "browser_use",
-    "in_app_browser",
-];
+const PLUGIN_BLOCKING_FEATURE_FLAGS: &[&str] =
+    &["plugins", "computer_use", "browser_use", "in_app_browser"];
 const REQUIRED_OPENAI_BUNDLED_PLUGIN_IDS: &[&str] = &[
     "browser@openai-bundled",
     "chrome@openai-bundled",
@@ -58,6 +63,8 @@ const LEGACY_BAD_LOCAL_AUTH_API_KEY: &str = "codexhub-dummy-key";
 const MANAGED_BACKUP_VERSION: u32 = 1;
 const MANAGED_BACKUP_MANIFEST: &str = "manifest.json";
 const MANAGED_BACKUP_AUTH: &str = "auth.json";
+const PROXY_ENVIRONMENT_BACKUP_VERSION: u32 = 1;
+const PROXY_ENVIRONMENT_BACKUP_FILE: &str = "proxy-environment.json";
 
 #[derive(Debug, Clone)]
 pub struct ConfigureCodexAppOptions {
@@ -186,6 +193,16 @@ struct ManagedCodexAppBackupManifest {
     auth_existed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedProxyEnvironmentBackup {
+    version: u32,
+    original_no_proxy: Option<String>,
+    original_lowercase_no_proxy: Option<String>,
+    managed_no_proxy: String,
+    managed_lowercase_no_proxy: Option<String>,
+}
+
 pub fn configure_codex_app(options: ConfigureCodexAppOptions) -> Result<ConfigureCodexAppReport> {
     let codex_home = options
         .codex_home
@@ -240,8 +257,21 @@ pub fn configure_codex_app(options: ConfigureCodexAppOptions) -> Result<Configur
         legacy_plugin_cleanup.removed_remote_catalog_files
     ));
 
+    chain_log::write_line("[codex_app_config] event=clear_connector_directory_cache_start");
+    let removed_connector_cache = clear_connector_directory_cache(&codex_home)?;
+    chain_log::write_line(format!(
+        "[codex_app_config] event=clear_connector_directory_cache_done removed_files={removed_connector_cache}"
+    ));
+
     chain_log::write_line("[codex_app_config] event=remote_control_switch_start");
-    let remote_control_switch = enable_remote_control_switch_in_home(&codex_home)?;
+    let codex_backend_url = options.codex_backend_url();
+    let remote_control_switch = enable_remote_control_switch_in_home(
+        &codex_home,
+        Some(RemoteControlPreferenceInput {
+            backend_url: &codex_backend_url,
+            account_id: &options.account_id,
+        }),
+    )?;
     chain_log::write_line(format!(
         "[codex_app_config] event=remote_control_switch_done configured={}",
         remote_control_switch.configured
@@ -351,7 +381,23 @@ pub fn enable_codex_app_remote_control_switch(
     codex_home: Option<PathBuf>,
 ) -> Result<CodexAppRemoteControlSwitchStatus> {
     let codex_home = codex_home.unwrap_or_else(default_codex_home);
-    enable_remote_control_switch_in_home(&codex_home)
+    enable_remote_control_switch_in_home(&codex_home, None)
+}
+
+pub fn enable_codex_app_remote_control_switch_for_backend(
+    codex_home: Option<PathBuf>,
+    backend_url: &str,
+) -> Result<CodexAppRemoteControlSwitchStatus> {
+    let codex_home = codex_home.unwrap_or_else(default_codex_home);
+    let account_id = read_local_auth_account_id(&codex_home.join("auth.json"))
+        .unwrap_or_else(|| "acct_codexhub_local".to_string());
+    enable_remote_control_switch_in_home(
+        &codex_home,
+        Some(RemoteControlPreferenceInput {
+            backend_url,
+            account_id: &account_id,
+        }),
+    )
 }
 
 pub fn delete_codex_app_provider(
@@ -389,8 +435,14 @@ pub fn set_codex_app_provider_websocket(
     Ok(config_path)
 }
 
+struct RemoteControlPreferenceInput<'a> {
+    backend_url: &'a str,
+    account_id: &'a str,
+}
+
 fn enable_remote_control_switch_in_home(
     codex_home: &Path,
+    preference: Option<RemoteControlPreferenceInput<'_>>,
 ) -> Result<CodexAppRemoteControlSwitchStatus> {
     let sqlite_dir = codex_home.join(CODEX_APP_SQLITE_DIR);
     std::fs::create_dir_all(&sqlite_dir).with_context(|| {
@@ -402,6 +454,14 @@ fn enable_remote_control_switch_in_home(
 
     for db_path in codex_app_feature_db_paths(codex_home) {
         upsert_remote_control_feature(&db_path)?;
+    }
+    if let Some(preference) = preference {
+        upsert_official_remote_control_enrollment(
+            codex_home,
+            preference.backend_url,
+            preference.account_id,
+        )?;
+        enable_app_server_daemon_remote_control(codex_home)?;
     }
 
     let status = inspect_remote_control_switch_in_home(codex_home);
@@ -498,6 +558,221 @@ fn upsert_remote_control_feature(path: &Path) -> Result<()> {
                 path.display()
             )
         })?;
+    Ok(())
+}
+
+fn upsert_official_remote_control_enrollment(
+    codex_home: &Path,
+    backend_url: &str,
+    account_id: &str,
+) -> Result<()> {
+    let installation_id = resolve_codex_installation_id(codex_home)?;
+    let websocket_url = normalize_remote_control_websocket_url(backend_url)?;
+    let state_db_path = codex_home.join(CODEX_APP_STATE_DB);
+    let connection = Connection::open(&state_db_path).with_context(|| {
+        format!(
+            "failed to open Codex App state DB {}",
+            state_db_path.display()
+        )
+    })?;
+    connection
+        .busy_timeout(SQLITE_WRITE_BUSY_TIMEOUT)
+        .with_context(|| {
+            format!(
+                "failed to configure sqlite busy timeout for {}",
+                state_db_path.display()
+            )
+        })?;
+    ensure_remote_control_enrollments_schema(&connection, &state_db_path)?;
+
+    let server_id = stable_remote_control_id("srv", &installation_id);
+    let environment_id = stable_remote_control_id("env", &installation_id);
+    let updated_at = i64::try_from(unix_now()?).map_err(|_| anyhow!("system time is too large"))?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO remote_control_enrollments (
+                websocket_url,
+                account_id,
+                app_server_client_name,
+                server_id,
+                environment_id,
+                server_name,
+                updated_at,
+                remote_control_enabled
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(websocket_url, account_id, app_server_client_name) DO UPDATE SET
+                server_id = excluded.server_id,
+                environment_id = excluded.environment_id,
+                server_name = excluded.server_name,
+                updated_at = excluded.updated_at,
+                remote_control_enabled = excluded.remote_control_enabled
+            "#,
+            params![
+                websocket_url,
+                account_id,
+                "",
+                server_id,
+                environment_id,
+                CODEX_APP_REMOTE_CONTROL_SERVER_NAME,
+                updated_at,
+                1_i64
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "failed to upsert remote_control enrollment in {}",
+                state_db_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn ensure_remote_control_enrollments_schema(
+    connection: &Connection,
+    state_db_path: &Path,
+) -> Result<()> {
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS remote_control_enrollments (
+                websocket_url TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                app_server_client_name TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                remote_control_enabled INTEGER,
+                PRIMARY KEY (websocket_url, account_id, app_server_client_name)
+            );
+            "#,
+        )
+        .with_context(|| {
+            format!(
+                "failed to ensure remote_control_enrollments in {}",
+                state_db_path.display()
+            )
+        })?;
+
+    if !sqlite_table_has_column(
+        connection,
+        "remote_control_enrollments",
+        "remote_control_enabled",
+    )? {
+        connection
+            .execute(
+                "ALTER TABLE remote_control_enrollments ADD COLUMN remote_control_enabled INTEGER",
+                [],
+            )
+            .with_context(|| {
+                format!(
+                    "failed to add remote_control_enabled column in {}",
+                    state_db_path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn sqlite_table_has_column(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_remote_control_websocket_url(backend_url: &str) -> Result<String> {
+    let mut remote_control_url = url::Url::parse(backend_url)
+        .with_context(|| format!("invalid remote control URL `{backend_url}`"))?;
+    if !remote_control_url.path().ends_with('/') {
+        let normalized_path = format!("{}/", remote_control_url.path());
+        remote_control_url.set_path(&normalized_path);
+    }
+
+    let mut websocket_url = remote_control_url
+        .join("wham/remote/control/server")
+        .with_context(|| format!("invalid remote control URL `{backend_url}`"))?;
+    let scheme = match remote_control_url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        other => return Err(anyhow!("unsupported remote control URL scheme `{other}`")),
+    };
+    websocket_url
+        .set_scheme(scheme)
+        .map_err(|()| anyhow!("unsupported remote control URL scheme `{scheme}`"))?;
+    Ok(websocket_url.to_string())
+}
+
+fn resolve_codex_installation_id(codex_home: &Path) -> Result<String> {
+    std::fs::create_dir_all(codex_home)
+        .with_context(|| format!("failed to create Codex home {}", codex_home.display()))?;
+    let path = codex_home.join(CODEX_APP_INSTALLATION_ID);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let trimmed = contents.trim();
+    if !trimmed.is_empty() {
+        if let Ok(existing) = uuid::Uuid::parse_str(trimmed) {
+            return Ok(existing.to_string());
+        }
+    }
+
+    let installation_id = uuid::Uuid::new_v4().to_string();
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    file.write_all(installation_id.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(installation_id)
+}
+
+fn stable_remote_control_id(prefix: &str, seed: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{prefix}_{hash:016x}")
+}
+
+fn enable_app_server_daemon_remote_control(codex_home: &Path) -> Result<()> {
+    let settings_path = codex_home
+        .join(CODEX_APP_SERVER_DAEMON_DIR)
+        .join(CODEX_APP_SERVER_DAEMON_SETTINGS);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut settings = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| json!({}));
+    settings["remoteControlEnabled"] = serde_json::Value::Bool(true);
+
+    let raw = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(&settings_path, format!("{raw}\n"))
+        .with_context(|| format!("failed to write {}", settings_path.display()))?;
     Ok(())
 }
 
@@ -688,6 +963,7 @@ pub fn configure_gui_environment(
 ) -> CodexAppGuiApiBaseStatus {
     #[cfg(target_os = "windows")]
     {
+        let legacy_proxy_cleanup_result = cleanup_legacy_global_proxy_bypass();
         let configure_result = if fast_startup_enabled {
             gui_unsetenv_many(&[CODEX_API_BASE_URL_ENV])
                 .and_then(|_| gui_setenv(CODEX_API_ENDPOINT_ENV, "localhost"))
@@ -700,12 +976,15 @@ pub fn configure_gui_environment(
             ])
         };
         let mut status = inspect_gui_api_base_url_for_mode(backend_url, fast_startup_enabled);
-        status.error = configure_result.err();
+        status.error = configure_result
+            .err()
+            .or_else(|| legacy_proxy_cleanup_result.err());
         status
     }
 
     #[cfg(target_os = "macos")]
     {
+        let legacy_proxy_cleanup_result = cleanup_legacy_global_proxy_bypass();
         let api_result = if fast_startup_enabled {
             gui_unsetenv(CODEX_API_BASE_URL_ENV)
                 .and_then(|_| gui_setenv(CODEX_API_ENDPOINT_ENV, "localhost"))
@@ -714,7 +993,10 @@ pub fn configure_gui_environment(
         };
         let issuer_result = gui_unsetenv(CODEX_APP_SERVER_LOGIN_ISSUER_ENV);
         let mut status = inspect_gui_api_base_url_for_mode(backend_url, fast_startup_enabled);
-        status.error = api_result.err().or_else(|| issuer_result.err());
+        status.error = api_result
+            .err()
+            .or_else(|| issuer_result.err())
+            .or_else(|| legacy_proxy_cleanup_result.err());
         status
     }
 
@@ -727,23 +1009,30 @@ pub fn configure_gui_environment(
 pub fn cleanup_gui_environment(backend_url: &str) -> CodexAppGuiApiBaseStatus {
     #[cfg(target_os = "windows")]
     {
+        let legacy_proxy_cleanup_result = cleanup_legacy_global_proxy_bypass();
         let cleanup_result = gui_unsetenv_many(&[
             CODEX_API_BASE_URL_ENV,
             CODEX_API_ENDPOINT_ENV,
             CODEX_APP_SERVER_LOGIN_ISSUER_ENV,
         ]);
         let mut status = inspect_gui_api_base_url(backend_url);
-        status.error = cleanup_result.err();
+        status.error = cleanup_result
+            .err()
+            .or_else(|| legacy_proxy_cleanup_result.err());
         status
     }
 
     #[cfg(target_os = "macos")]
     {
+        let legacy_proxy_cleanup_result = cleanup_legacy_global_proxy_bypass();
         let api_result =
             gui_unsetenv(CODEX_API_BASE_URL_ENV).and_then(|_| gui_unsetenv(CODEX_API_ENDPOINT_ENV));
         let issuer_result = gui_unsetenv(CODEX_APP_SERVER_LOGIN_ISSUER_ENV);
         let mut status = inspect_gui_api_base_url(backend_url);
-        status.error = api_result.err().or_else(|| issuer_result.err());
+        status.error = api_result
+            .err()
+            .or_else(|| issuer_result.err())
+            .or_else(|| legacy_proxy_cleanup_result.err());
         status
     }
 
@@ -751,6 +1040,110 @@ pub fn cleanup_gui_environment(backend_url: &str) -> CodexAppGuiApiBaseStatus {
     {
         inspect_gui_api_base_url(backend_url)
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn cleanup_legacy_global_proxy_bypass() -> Result<(), String> {
+    let backup_path = managed_proxy_environment_backup_path();
+    let Some(backup) = read_proxy_environment_backup(&backup_path)? else {
+        return Ok(());
+    };
+
+    let restored_no_proxy = restore_managed_no_proxy_value(
+        gui_getenv(NO_PROXY_ENV)?.as_deref(),
+        backup.original_no_proxy.as_deref(),
+        &backup.managed_no_proxy,
+    );
+    gui_set_or_unsetenv(NO_PROXY_ENV, restored_no_proxy.as_deref())?;
+
+    #[cfg(target_os = "macos")]
+    if let Some(managed_lowercase_no_proxy) = backup.managed_lowercase_no_proxy.as_deref() {
+        let restored_lowercase_no_proxy = restore_managed_no_proxy_value(
+            gui_getenv(LOWERCASE_NO_PROXY_ENV)?.as_deref(),
+            backup.original_lowercase_no_proxy.as_deref(),
+            managed_lowercase_no_proxy,
+        );
+        gui_set_or_unsetenv(
+            LOWERCASE_NO_PROXY_ENV,
+            restored_lowercase_no_proxy.as_deref(),
+        )?;
+    }
+
+    match std::fs::remove_file(&backup_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
+    }
+    chain_log::write_line("[codex_app_config] event=legacy_global_proxy_bypass_restored");
+    Ok(())
+}
+
+fn restore_managed_no_proxy_value(
+    current: Option<&str>,
+    original: Option<&str>,
+    managed: &str,
+) -> Option<String> {
+    if current == Some(managed) {
+        return original.map(str::to_string);
+    }
+
+    let original_entries = no_proxy_entry_set(original);
+    let managed_additions = no_proxy_entry_set(Some(managed))
+        .difference(&original_entries)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let retained = current
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| !managed_additions.contains(&entry.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!retained.is_empty()).then(|| retained.join(","))
+}
+
+fn no_proxy_entry_set(value: Option<&str>) -> HashSet<String> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn gui_set_or_unsetenv(name: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(value) => gui_setenv(name, value),
+        None => gui_unsetenv(name),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn gui_unsetenv(name: &str) -> Result<(), String> {
+    gui_unsetenv_many(&[name])
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn read_proxy_environment_backup(
+    path: &Path,
+) -> Result<Option<ManagedProxyEnvironmentBackup>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    let backup = serde_json::from_str::<ManagedProxyEnvironmentBackup>(&raw)
+        .map_err(|err| err.to_string())?;
+    if backup.version != PROXY_ENVIRONMENT_BACKUP_VERSION {
+        return Err(format!(
+            "unsupported proxy environment backup version {}",
+            backup.version
+        ));
+    }
+    Ok(Some(backup))
 }
 
 #[cfg(target_os = "macos")]
@@ -961,6 +1354,19 @@ fn inspect_auth_json(path: &Path) -> (bool, Option<String>) {
     }
 }
 
+fn read_local_auth_account_id(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let auth = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    if !is_codexhub_auth_json(&auth) {
+        return None;
+    }
+    auth.pointer("/tokens/account_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn inspect_provider_catalog(
     path: &Path,
 ) -> (
@@ -1107,10 +1513,12 @@ fn write_config_toml(path: &Path, options: &ConfigureCodexAppOptions) -> Result<
     }
 
     remove_disabled_plugin_feature_flags(&mut doc);
+    disable_host_owned_codex_apps(&mut doc);
     remove_legacy_openai_bundled_marketplace(&mut doc);
     upsert_enabled_plugins(&mut doc, REQUIRED_OPENAI_BUNDLED_PLUGIN_IDS);
     if let Some(openai_curated) = find_openai_curated_marketplace_root(&codex_home) {
         upsert_local_marketplace(&mut doc, OPENAI_CURATED_MARKETPLACE_NAME, &openai_curated);
+        filter_curated_marketplace_manifests(&openai_curated);
     }
     disable_default_otel_telemetry(&mut doc);
 
@@ -1138,6 +1546,18 @@ fn remove_disabled_plugin_feature_flags(doc: &mut toml_edit::DocumentMut) {
     if remove_features {
         doc.remove("features");
     }
+}
+
+// The `codex_apps` MCP is a host-owned server Codex auto-registers whenever the
+// `apps` feature is enabled and the session uses a Codex backend. Its transport
+// is a ChatGPT-hosted streamable HTTP endpoint (e.g. `.../backend-api/wham/apps`),
+// which codexhub does not implement, so startup logs an `MCP client for
+// `codex_apps` failed to start` error and the Apps/Connectors that depend on
+// OpenAI's remote services are surfaced but unusable. codexhub runs fully against
+// a local backend, so we turn the feature off to skip the registration entirely.
+fn disable_host_owned_codex_apps(doc: &mut toml_edit::DocumentMut) {
+    let features = ensure_config_table(doc, "features");
+    features["apps"] = toml_edit::value(false);
 }
 
 fn remove_legacy_openai_bundled_marketplace(doc: &mut toml_edit::DocumentMut) {
@@ -1284,6 +1704,117 @@ fn openai_curated_marketplace_exists(path: &Path) -> bool {
         .join("plugins")
         .join("marketplace.json")
         .is_file()
+}
+
+// Codex reads a `source_type = "local"` marketplace straight off disk from
+// `.agents/plugins/{marketplace,api_marketplace}.json`, so our HTTP-level
+// plugin filtering (which only affects the discovery API) never touches what
+// the app actually enumerates. The curated catalog ships ~180 entries, and the
+// large majority depend on OpenAI's remote Apps/Connector backend (`.app.json`)
+// or a hosted HTTP MCP server (`.mcp.json` with a bare `url`/`http`/`sse`
+// transport). None of those work against codexhub's local gateway, so we prune
+// them from the on-disk manifests, leaving only skill-only plugins and plugins
+// whose `.mcp.json` launches a local stdio `command`.
+//
+// This rewrites provisioned state Codex regenerates; the curated checkout has
+// no git remote, and uninstall only drops the config.toml marketplace entry, so
+// pruning here matches how codexhub already treats `.tmp/plugins`.
+fn filter_curated_marketplace_manifests(marketplace_root: &Path) {
+    const MANIFEST_RELATIVE_PATHS: &[&str] = &["marketplace.json", "api_marketplace.json"];
+    for relative in MANIFEST_RELATIVE_PATHS {
+        let manifest_path = marketplace_root
+            .join(".agents")
+            .join("plugins")
+            .join(relative);
+        if !manifest_path.is_file() {
+            continue;
+        }
+        match filter_one_curated_manifest(marketplace_root, &manifest_path) {
+            Ok(Some((total, kept))) => chain_log::write_line(format!(
+                "[codex_app_config] event=curated_manifest_filtered path={} total={} kept={} removed={}",
+                manifest_path.display(),
+                total,
+                kept,
+                total.saturating_sub(kept)
+            )),
+            Ok(None) => {}
+            Err(err) => chain_log::write_line(format!(
+                "[codex_app_config] event=curated_manifest_filter_failed path={} error={}",
+                manifest_path.display(),
+                err
+            )),
+        }
+    }
+}
+
+// Returns `Some((total, kept))` when the manifest changed and was rewritten, or
+// `None` when nothing needed pruning.
+fn filter_one_curated_manifest(
+    marketplace_root: &Path,
+    manifest_path: &Path,
+) -> Result<Option<(usize, usize)>> {
+    let contents = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let Some(plugins) = manifest
+        .get_mut("plugins")
+        .and_then(|item| item.as_array_mut())
+    else {
+        return Ok(None);
+    };
+
+    let total = plugins.len();
+    plugins.retain(|plugin| {
+        !curated_manifest_plugin_requires_remote_backend(marketplace_root, plugin)
+    });
+    let kept = plugins.len();
+    if kept == total {
+        return Ok(None);
+    }
+
+    let mut serialized = serde_json::to_string_pretty(&manifest)
+        .with_context(|| format!("failed to serialize {}", manifest_path.display()))?;
+    serialized.push('\n');
+    std::fs::write(manifest_path, serialized)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+    Ok(Some((total, kept)))
+}
+
+fn curated_manifest_plugin_requires_remote_backend(
+    marketplace_root: &Path,
+    plugin: &serde_json::Value,
+) -> bool {
+    let Some(dir) = curated_manifest_plugin_dir(marketplace_root, plugin) else {
+        // If we cannot resolve the plugin directory we keep it rather than risk
+        // hiding a usable plugin.
+        return false;
+    };
+    crate::web::plugins::plugin_dir_requires_remote_backend(&dir)
+}
+
+fn curated_manifest_plugin_dir(
+    marketplace_root: &Path,
+    plugin: &serde_json::Value,
+) -> Option<PathBuf> {
+    let raw_path = plugin
+        .get("source")
+        .and_then(|source| source.get("path"))
+        .and_then(|value| value.as_str())?;
+    let relative = raw_path.trim_start_matches("./").replace('\\', "/");
+    if relative.is_empty() {
+        return None;
+    }
+
+    let mut dir = marketplace_root.to_path_buf();
+    for segment in relative.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return None,
+            segment => dir.push(segment),
+        }
+    }
+    Some(dir)
 }
 
 fn normalize_config_toml_order(raw: &str) -> String {
@@ -2046,6 +2577,12 @@ fn managed_backup_paths(codex_home: &Path) -> ManagedBackupPaths {
     }
 }
 
+fn managed_proxy_environment_backup_path() -> PathBuf {
+    codexhub_app_support_dir()
+        .join("backups")
+        .join(PROXY_ENVIRONMENT_BACKUP_FILE)
+}
+
 fn codex_home_backup_id(codex_home: &Path) -> String {
     let normalized = codex_home
         .to_string_lossy()
@@ -2237,6 +2774,50 @@ pub(crate) fn clear_codex_models_cache(codex_home: Option<PathBuf>) -> Result<bo
     }
 }
 
+// Codex caches the remote connector/App directory (Gmail, Google Drive, GitHub,
+// ...) on disk under `cache/codex_app_directory/<hash>.json`. That cache has no
+// TTL: `codex_connectors::cached_directory_connectors` returns a disk `Hit`
+// verbatim, so a stale catalog captured under an official ChatGPT backend keeps
+// surfacing thousands of unusable Apps even after codexhub starts serving an
+// empty `/api/connectors/directory/list`. We wipe the cache during the initial
+// "初始化 Codex 配置" flow so a codex-app restart repopulates it from codexhub's
+// (empty) directory instead. This is pure cache, so the uninstall/restore path
+// intentionally leaves it alone.
+fn clear_connector_directory_cache(codex_home: &Path) -> Result<usize> {
+    let cache_dir = codex_home.join(CODEX_CONNECTOR_DIRECTORY_CACHE_DIR);
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", cache_dir.display()));
+        }
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_file = entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false);
+        let is_json = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !is_file || !is_json {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct LegacyBundledPluginStateCleanup {
     removed_remote_identity_files: usize,
@@ -2318,6 +2899,42 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn restore_managed_no_proxy_value_restores_unchanged_original() {
+        assert_eq!(
+            restore_managed_no_proxy_value(
+                Some("example.internal,localhost,127.0.0.1,::1"),
+                Some("example.internal"),
+                "example.internal,localhost,127.0.0.1,::1",
+            ),
+            Some("example.internal".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_managed_no_proxy_value_keeps_later_user_entries() {
+        assert_eq!(
+            restore_managed_no_proxy_value(
+                Some("example.internal,localhost,127.0.0.1,::1,later.internal"),
+                Some("example.internal"),
+                "example.internal,localhost,127.0.0.1,::1",
+            ),
+            Some("example.internal,later.internal".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_managed_no_proxy_value_keeps_preexisting_loopback_entry() {
+        assert_eq!(
+            restore_managed_no_proxy_value(
+                Some("localhost,127.0.0.1,::1"),
+                Some("localhost"),
+                "localhost,127.0.0.1,::1",
+            ),
+            Some("localhost".to_string())
+        );
+    }
+
+    #[test]
     fn configure_codex_app_writes_provider_and_local_auth() {
         let codex_home = unique_temp_dir();
         let report = configure_codex_app(ConfigureCodexAppOptions {
@@ -2348,8 +2965,8 @@ mod tests {
         assert!(!config.contains("disable_response_storage"));
         assert!(!config.contains("network_access"));
         assert!(!config.contains("windows_wsl_setup_acknowledged"));
-        assert!(!config.contains("[features]"));
-        assert!(!config.contains("apps = false"));
+        assert!(config.contains("[features]"));
+        assert!(config.contains("apps = false"));
         assert!(!config.contains("image_generation = false"));
         assert!(config.contains("[model_providers.ai-codex]"));
         assert!(config.contains("base_url = \"https://api.example.invalid\""));
@@ -2694,7 +3311,7 @@ env_key = "AI_GATEWAY_API_KEY"
     }
 
     #[test]
-    fn configure_codex_app_preserves_explicit_apps_feature() {
+    fn configure_codex_app_forces_apps_feature_off() {
         let codex_home = unique_temp_dir();
         let config_path = codex_home.join("config.toml");
         std::fs::write(
@@ -2729,9 +3346,11 @@ name = "old-provider"
 
         let config = std::fs::read_to_string(report.config_path).expect("read config");
         assert!(config.contains("[features]"));
-        assert!(config.contains("apps = true"));
+        // codexhub always disables the host-owned `codex_apps` MCP, even when the
+        // user previously enabled the `apps` feature explicitly.
+        assert!(config.contains("apps = false"));
+        assert!(!config.contains("apps = true"));
         assert!(config.contains("image_generation = true"));
-        assert!(!config.contains("apps = false"));
         assert!(!config.contains("image_generation = false"));
 
         let _ = std::fs::remove_dir_all(codex_home);
@@ -2758,7 +3377,9 @@ keep_me = false
         configure_codex_app(test_configure_options(codex_home.clone())).expect("configure");
 
         let config = std::fs::read_to_string(config_path).expect("read config");
-        assert!(!config.contains("apps = false"));
+        // `apps` is no longer a plugin-blocking flag: codexhub keeps it set to
+        // false so Codex skips the host-owned `codex_apps` MCP registration.
+        assert!(config.contains("apps = false"));
         assert!(!config.contains("plugins = false"));
         assert!(!config.contains("computer_use = false"));
         assert!(!config.contains("browser_use = false"));
@@ -2820,6 +3441,91 @@ source = 'C:\Users\test\.codex\.tmp\bundled-marketplaces\openai-bundled'
                 .and_then(|item| item.as_str()),
             Some(curated_marketplace_root.to_string_lossy().as_ref())
         );
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn configure_codex_app_prunes_remote_backed_curated_plugins_from_disk() {
+        let codex_home = unique_temp_dir();
+        let config_path = codex_home.join("config.toml");
+        let curated_root = codex_home.join(".tmp").join("plugins");
+        let manifest_dir = curated_root.join(".agents").join("plugins");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+
+        // A hosted Apps/Connector plugin (`.app.json`) => remote-backed.
+        let github_dir = curated_root.join("plugins").join("github");
+        std::fs::create_dir_all(&github_dir).expect("create github dir");
+        std::fs::write(github_dir.join(".app.json"), r#"{"id":"github"}"#)
+            .expect("write github app");
+        // A hosted HTTP MCP plugin (bare `url`) => remote-backed.
+        let notion_dir = curated_root.join("plugins").join("notion");
+        std::fs::create_dir_all(&notion_dir).expect("create notion dir");
+        std::fs::write(
+            notion_dir.join(".mcp.json"),
+            r#"{"mcpServers":{"notion":{"url":"https://mcp.notion.com/mcp"}}}"#,
+        )
+        .expect("write notion mcp");
+        // A local stdio MCP plugin => keep.
+        let sentry_dir = curated_root.join("plugins").join("sentry");
+        std::fs::create_dir_all(&sentry_dir).expect("create sentry dir");
+        std::fs::write(
+            sentry_dir.join(".mcp.json"),
+            r#"{"mcpServers":{"sentry":{"command":"sentry-mcp"}}}"#,
+        )
+        .expect("write sentry mcp");
+        // A skill-only plugin => keep.
+        let superpowers_dir = curated_root.join("plugins").join("superpowers");
+        std::fs::create_dir_all(&superpowers_dir).expect("create superpowers dir");
+
+        let manifest = r#"{
+  "name": "openai-curated",
+  "plugins": [
+    {"name": "github", "source": {"source": "local", "path": "./plugins/github"}},
+    {"name": "notion", "source": {"source": "local", "path": "./plugins/notion"}},
+    {"name": "sentry", "source": {"source": "local", "path": "./plugins/sentry"}},
+    {"name": "superpowers", "source": {"source": "local", "path": "./plugins/superpowers"}}
+  ]
+}"#;
+        std::fs::write(manifest_dir.join("marketplace.json"), manifest)
+            .expect("write marketplace.json");
+        std::fs::write(manifest_dir.join("api_marketplace.json"), manifest)
+            .expect("write api_marketplace.json");
+
+        std::fs::write(&config_path, "").expect("write config");
+
+        configure_codex_app(test_configure_options(codex_home.clone())).expect("configure");
+
+        for relative in ["marketplace.json", "api_marketplace.json"] {
+            let filtered = std::fs::read_to_string(manifest_dir.join(relative))
+                .expect("read filtered manifest");
+            // Regression guard: the manifests Codex parses with serde_json must
+            // never carry a UTF-8 BOM, otherwise plugin loading fails with
+            // "expected value at line 1 column 1".
+            let raw_bytes =
+                std::fs::read(manifest_dir.join(relative)).expect("read filtered manifest bytes");
+            assert_ne!(
+                raw_bytes.get(0..3),
+                Some([0xEF, 0xBB, 0xBF].as_slice()),
+                "{relative} must not be written with a UTF-8 BOM"
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&filtered).expect("parse filtered manifest");
+            let names = value
+                .get("plugins")
+                .and_then(|item| item.as_array())
+                .expect("plugins array")
+                .iter()
+                .filter_map(|plugin| plugin.get("name").and_then(|name| name.as_str()))
+                .collect::<Vec<_>>();
+            assert!(!names.contains(&"github"), "{relative} still lists github");
+            assert!(!names.contains(&"notion"), "{relative} still lists notion");
+            assert!(names.contains(&"sentry"), "{relative} dropped sentry");
+            assert!(
+                names.contains(&"superpowers"),
+                "{relative} dropped superpowers"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(codex_home);
     }
@@ -3139,6 +3845,100 @@ base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             .expect("codex db status");
         assert_eq!(db_status.enabled, Some(true));
         assert!(db_status.updated_at.unwrap_or_default() > 1);
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn configure_codex_app_persists_official_remote_control_preference() {
+        let codex_home = unique_temp_dir();
+        let installation_id = "11111111-1111-4111-8111-111111111111";
+        std::fs::write(codex_home.join("installation_id"), installation_id)
+            .expect("write installation id");
+        create_remote_control_enrollment_state_db(&codex_home);
+
+        configure_codex_app(ConfigureCodexAppOptions {
+            codex_home: Some(codex_home.clone()),
+            backend_url: "http://127.0.0.1:3847/backend-api".to_string(),
+            connection_mode: LocalConnectionMode::Standard,
+            account_id: "acct_test".to_string(),
+            user_id: "user_test".to_string(),
+            email: "local@example.test".to_string(),
+            plan_type: "pro".to_string(),
+            provider_name: None,
+            provider_base_url: None,
+            provider_key: None,
+            activate_provider: true,
+            image_generation_enabled: None,
+            provider_supports_websockets: None,
+            fast_startup_enabled: true,
+        })
+        .expect("configure codex app");
+
+        let connection =
+            Connection::open(codex_home.join("state_5.sqlite")).expect("open state db");
+        let row = connection
+            .query_row(
+                r#"
+                SELECT websocket_url, account_id, app_server_client_name, server_id,
+                       environment_id, remote_control_enabled
+                FROM remote_control_enrollments
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .expect("remote control enrollment row");
+
+        assert_eq!(
+            row.0,
+            "ws://127.0.0.1:3847/backend-api/wham/remote/control/server"
+        );
+        assert_eq!(row.1, "acct_test");
+        assert_eq!(row.2, "");
+        assert_eq!(row.3, test_stable_id("srv", installation_id));
+        assert_eq!(row.4, test_stable_id("env", installation_id));
+        assert_eq!(row.5, 1);
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn configure_codex_app_enables_app_server_daemon_remote_control() {
+        let codex_home = unique_temp_dir();
+
+        configure_codex_app(ConfigureCodexAppOptions {
+            codex_home: Some(codex_home.clone()),
+            backend_url: "http://127.0.0.1:3847/backend-api".to_string(),
+            connection_mode: LocalConnectionMode::Standard,
+            account_id: "acct_test".to_string(),
+            user_id: "user_test".to_string(),
+            email: "local@example.test".to_string(),
+            plan_type: "pro".to_string(),
+            provider_name: None,
+            provider_base_url: None,
+            provider_key: None,
+            activate_provider: true,
+            image_generation_enabled: None,
+            provider_supports_websockets: None,
+            fast_startup_enabled: true,
+        })
+        .expect("configure codex app");
+
+        let raw =
+            std::fs::read_to_string(codex_home.join("app-server-daemon").join("settings.json"))
+                .expect("read daemon settings");
+        let settings = serde_json::from_str::<serde_json::Value>(&raw).expect("parse settings");
+
+        assert_eq!(settings["remoteControlEnabled"], true);
 
         let _ = std::fs::remove_dir_all(codex_home);
     }
@@ -3553,6 +4353,37 @@ base_url = "https://api.example.invalid"
         dir
     }
 
+    fn create_remote_control_enrollment_state_db(codex_home: &Path) {
+        let connection =
+            Connection::open(codex_home.join("state_5.sqlite")).expect("open state db");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE remote_control_enrollments (
+                    websocket_url TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    app_server_client_name TEXT NOT NULL,
+                    server_id TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    server_name TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    remote_control_enabled INTEGER,
+                    PRIMARY KEY (websocket_url, account_id, app_server_client_name)
+                );
+                "#,
+            )
+            .expect("create remote control enrollment table");
+    }
+
+    fn test_stable_id(prefix: &str, seed: &str) -> String {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in seed.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{prefix}_{hash:016x}")
+    }
+
     fn official_chatgpt_auth_json(
         account_id: &str,
         user_id: &str,
@@ -3644,6 +4475,36 @@ base_url = "https://api.example.invalid"
         let removed = clear_codex_models_cache(Some(codex_home.clone())).expect("clear cache");
 
         assert!(!removed);
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn clear_connector_directory_cache_removes_only_json_files() {
+        let codex_home = unique_temp_dir();
+        let cache_dir = codex_home.join(CODEX_CONNECTOR_DIRECTORY_CACHE_DIR);
+        std::fs::create_dir_all(&cache_dir).expect("create connector cache dir");
+        std::fs::write(cache_dir.join("aaa.json"), r#"{"connectors":[]}"#).expect("write cache a");
+        std::fs::write(cache_dir.join("bbb.json"), r#"{"connectors":[]}"#).expect("write cache b");
+        // A non-json sibling must be left untouched.
+        std::fs::write(cache_dir.join("notes.txt"), "keep me").expect("write sidecar");
+
+        let removed = clear_connector_directory_cache(&codex_home).expect("clear connector cache");
+
+        assert_eq!(removed, 2);
+        assert!(!cache_dir.join("aaa.json").exists());
+        assert!(!cache_dir.join("bbb.json").exists());
+        assert!(cache_dir.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn clear_connector_directory_cache_ignores_missing_dir() {
+        let codex_home = unique_temp_dir();
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let removed = clear_connector_directory_cache(&codex_home).expect("clear connector cache");
+
+        assert_eq!(removed, 0);
         let _ = std::fs::remove_dir_all(codex_home);
     }
 

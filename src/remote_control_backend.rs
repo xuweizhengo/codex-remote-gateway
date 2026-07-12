@@ -12,7 +12,9 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::{
-    app_state::{RemoteControlInner, RemoteControlRecentEvent, SharedState},
+    app_state::{
+        RemoteControlInner, RemoteControlRecentEvent, RemoteControlServerConnection, SharedState,
+    },
     chain_log,
     codex::CodexNotification,
     types::now_ms,
@@ -63,8 +65,8 @@ use session_api::wait_for_remote_control_initialized;
 pub use session_api::{
     ThreadStartOptions, clear_thread_for_client, clear_turn_for_client, config_read_for_client,
     current_thread_for_client, interrupt_turn_for_client, model_list_for_client,
-    resume_thread_for_client, start_thread_for_client, start_turn_for_client,
-    thread_list_all_providers_for_client, thread_list_for_client, thread_loaded_list_for_client,
+    resume_thread_for_client, session_history_threads, start_thread_for_client,
+    start_turn_for_client, thread_list_for_client, thread_loaded_list_for_client,
 };
 pub use status::{RemoteControlStatusResponse, status_snapshot};
 use utils::*;
@@ -440,12 +442,63 @@ pub(super) fn remote_control_stale_reason_locked(
     remote: &RemoteControlInner,
     now_ms: u128,
 ) -> Option<String> {
-    if !remote.connected {
+    remote_control_liveness_stale_reason(
+        remote.connected,
+        remote.initialized,
+        remote.last_initialize_sent_at_ms.or(remote.connected_at_ms),
+        remote.last_ws_ping_at_ms,
+        remote.last_ws_pong_at_ms,
+        remote.connected_at_ms,
+        now_ms,
+    )
+}
+
+pub(super) fn remote_control_connection_stale_reason_locked(
+    remote: &RemoteControlInner,
+    connection_epoch: u64,
+    now_ms: u128,
+) -> Option<String> {
+    if remote.connections.is_empty() {
+        return (remote.connection_epoch == connection_epoch)
+            .then(|| remote_control_stale_reason_locked(remote, now_ms))
+            .flatten();
+    }
+    remote
+        .connections
+        .values()
+        .find(|connection| connection.connection_epoch == connection_epoch)
+        .and_then(|connection| remote_control_server_connection_stale_reason(connection, now_ms))
+}
+
+fn remote_control_server_connection_stale_reason(
+    connection: &RemoteControlServerConnection,
+    now_ms: u128,
+) -> Option<String> {
+    remote_control_liveness_stale_reason(
+        connection.connected,
+        connection.initialized,
+        connection.connected_at_ms,
+        connection.last_ws_ping_at_ms,
+        connection.last_ws_pong_at_ms,
+        connection.connected_at_ms,
+        now_ms,
+    )
+}
+
+fn remote_control_liveness_stale_reason(
+    connected: bool,
+    initialized: bool,
+    initialize_started_at_ms: Option<u128>,
+    last_ping_at_ms: Option<u128>,
+    last_pong_at_ms: Option<u128>,
+    connected_at_ms: Option<u128>,
+    now_ms: u128,
+) -> Option<String> {
+    if !connected {
         return None;
     }
     let timeout_ms = REMOTE_CONTROL_PONG_TIMEOUT.as_millis();
-    let initialize_started_at_ms = remote.last_initialize_sent_at_ms.or(remote.connected_at_ms);
-    if !remote.initialized
+    if !initialized
         && initialize_started_at_ms
             .is_some_and(|started_at_ms| now_ms.saturating_sub(started_at_ms) >= timeout_ms)
     {
@@ -454,10 +507,9 @@ pub(super) fn remote_control_stale_reason_locked(
             REMOTE_CONTROL_PONG_TIMEOUT.as_secs()
         ));
     }
-    if let Some(last_ping_at_ms) = remote.last_ws_ping_at_ms {
-        let last_pong_or_connect_at_ms = remote
-            .last_ws_pong_at_ms
-            .or(remote.connected_at_ms)
+    if let Some(last_ping_at_ms) = last_ping_at_ms {
+        let last_pong_or_connect_at_ms = last_pong_at_ms
+            .or(connected_at_ms)
             .unwrap_or(last_ping_at_ms);
         if last_ping_at_ms > last_pong_or_connect_at_ms
             && now_ms.saturating_sub(last_pong_or_connect_at_ms) >= timeout_ms
@@ -558,11 +610,11 @@ async fn ensure_remote_control_client_initialized(
     let requested_client_key = normalize_remote_client_key(client_key);
     let client_key = {
         let remote = state.remote_control.inner.lock().await;
-        if requested_client_key == DEFAULT_REMOTE_CLIENT_KEY {
-            default_client_key_for_connection_locked(&remote, connection_epoch)
-        } else {
-            requested_client_key
-        }
+        resolve_remote_client_key_for_connection_locked(
+            &remote,
+            connection_epoch,
+            &requested_client_key,
+        )
     };
     let should_initialize = {
         let mut remote = state.remote_control.inner.lock().await;
@@ -582,10 +634,9 @@ async fn ensure_remote_control_client_initialized(
                         .is_some_and(|connection| connection.initialized)
                 });
             let client = ensure_client_state_locked(&mut remote, &client_key);
-            let client_initializing = client
-                .pending
-                .values()
-                .any(|pending| pending.method == "initialize");
+            let client_initializing = client.pending.values().any(|pending| {
+                pending.method == "initialize" && pending.connection_epoch == connection_epoch
+            });
             let should_skip_initialize = client_initializing
                 || if !has_connection_map {
                     client.initialized
@@ -627,11 +678,11 @@ async fn ensure_remote_control_client_ready(state: &SharedState, client_key: &st
                 "remote-control websocket is not connected for client_key={requested_client_key}"
             )
         })?;
-        let resolved_client_key = if requested_client_key == DEFAULT_REMOTE_CLIENT_KEY {
-            default_client_key_for_connection_locked(&remote, connection_epoch)
-        } else {
-            requested_client_key
-        };
+        let resolved_client_key = resolve_remote_client_key_for_connection_locked(
+            &remote,
+            connection_epoch,
+            &requested_client_key,
+        );
         (connection_epoch, resolved_client_key)
     };
     ensure_remote_control_client_initialized(state, connection_epoch, &resolved_client_key).await?;

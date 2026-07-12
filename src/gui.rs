@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
+    path::{Path, PathBuf},
     process::Child,
     rc::Rc,
     sync::{
@@ -27,28 +28,34 @@ use crate::ai_gateway::config::{
     DEFAULT_PROVIDER_TIMEOUT_SECS, ProviderConfig, ProviderType, provider_api_root,
     provider_display_base_url,
 };
-use crate::config::{AppConfig, LocalConnectionMode};
+use crate::config::{AppConfig, LocalConnectionMode, OutboundProxyConfig, OutboundProxyMode};
+use crate::diagnostics_export::{
+    ConnectionDiagnosticsInput, connection_status_snapshot, export_connection_diagnostics_to_path,
+};
+use crate::types::now_ms;
 
 #[cfg(target_os = "windows")]
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3847";
 #[cfg(not(target_os = "windows"))]
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3847";
 const CODEX_APP_GUI_UNSUPPORTED: bool = !(cfg!(target_os = "macos") || cfg!(target_os = "windows"));
-const PROJECT_HOME_URL: &str = "https://github.com/xuweizhengo/codex-remote-gateway";
+const PROJECT_HOME_URL: &str = "https://github.com/xuweizhengo/codexhub";
 #[cfg(target_os = "windows")]
-const UPDATE_MANIFEST_URL: &str = "https://github.com/xuweizhengo/codex-remote-gateway/releases/latest/download/latest-windows.json";
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const UPDATE_MANIFEST_URL: &str = "https://github.com/xuweizhengo/codex-remote-gateway/releases/latest/download/latest-macos-intel.json";
-#[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
-const UPDATE_MANIFEST_URL: &str = "https://github.com/xuweizhengo/codex-remote-gateway/releases/latest/download/latest-macos.json";
+const UPDATE_MANIFEST_URL: &str =
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest-windows.json";
+const MACOS_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest-macos.json";
+#[cfg(target_os = "macos")]
+const UPDATE_MANIFEST_URL: &str = MACOS_UPDATE_MANIFEST_URL;
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-const UPDATE_MANIFEST_URL: &str = "https://github.com/xuweizhengo/codex-remote-gateway/releases/latest/download/latest-linux.json";
+const UPDATE_MANIFEST_URL: &str =
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest-linux.json";
 const LEGACY_UPDATE_MANIFEST_URL: &str =
-    "https://github.com/xuweizhengo/codex-remote-gateway/releases/latest/download/latest.json";
+    "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest.json";
 const UPDATE_RELEASE_API_URL: &str =
-    "https://api.github.com/repos/xuweizhengo/codex-remote-gateway/releases/latest";
+    "https://api.github.com/repos/xuweizhengo/codexhub/releases/latest";
 const UPDATE_RELEASE_PAGE_URL: &str =
-    "https://github.com/xuweizhengo/codex-remote-gateway/releases/latest";
+    "https://github.com/xuweizhengo/codexhub/releases/latest";
 const DASHBOARD_REFRESH_INTERVAL_MS: i32 = 10_000;
 const REQUEST_LOG_REFRESH_INTERVAL_MS: i32 = 5_000;
 const REQUEST_LOG_TAB_INDEX: i32 = 3;
@@ -60,6 +67,8 @@ const GUI_STATUS_TIMEOUT: Duration = Duration::from_millis(650);
 const GUI_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const GUI_CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
 const GUI_STARTUP_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_AUTO_RESTART_FAILURE_THRESHOLD: u64 = 3;
+const DAEMON_AUTO_RESTART_COOLDOWN_MS: u64 = 60_000;
 const GUI_MODEL_LIST_FETCH_TIMEOUT_SECS: u64 = 30;
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "windows")]
@@ -74,6 +83,10 @@ const ID_MENU_THEME_LIGHT: i32 = 10_007;
 const ID_MENU_THEME_DARK: i32 = 10_008;
 const ID_SERVICE_CONNECTION_SWITCH: i32 = 10_009;
 const ID_MENU_QUIT: i32 = 10_010;
+const ID_MENU_EXPORT_CONNECTION_DIAGNOSTICS: i32 = 10_011;
+const ID_MENU_PROXY_SYSTEM: i32 = 10_012;
+const ID_MENU_PROXY_DIRECT: i32 = 10_013;
+const ID_MENU_PROXY_CUSTOM: i32 = 10_014;
 
 type ImAccountRows = Rc<RefCell<Vec<[String; 5]>>>;
 type ImAccountModel = Rc<RefCell<CustomDataViewVirtualListModel>>;
@@ -87,6 +100,7 @@ type RequestLogDetailResultStore =
     Arc<Mutex<Option<(i64, Result<self::api::RequestLogDetail, String>)>>>;
 type RequestLogClearResultStore = Arc<Mutex<Option<Result<usize, String>>>>;
 type FetchModelsResultStore = Arc<Mutex<Option<Result<(Vec<String>, String), String>>>>;
+type DiagnosticsExportResultStore = Arc<Mutex<Option<Result<PathBuf, String>>>>;
 
 /// Messages sent from background threads to the GUI thread via idle events
 enum GuiMessage {
@@ -94,6 +108,7 @@ enum GuiMessage {
     ImAction(ImActionResult),
     AiGwAction(AiGwActionResult),
     DashboardUpdate,
+    DiagnosticsExport,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -133,7 +148,7 @@ use self::ai_gateway::{
     provider_logo_variant, provider_protocol_display, refresh_ai_gw_enable_logging,
     refresh_ai_gw_filter_image_generation, refresh_ai_gw_provider_list, save_ai_gw_provider,
     set_ai_gw_actions_enabled, set_ai_gw_provider_enabled, set_filter_image_generation_tool,
-    set_request_logging_enabled,
+    set_request_log_details_enabled, set_request_logging_enabled,
 };
 use self::api::{
     ApiClient, ConfigureTelegramBotRequest, DashboardSnapshot, DeleteImAccountRequest,
@@ -298,12 +313,16 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
     frame.set_icon(&app_icon_bitmap(48));
     let update_check_in_flight = Arc::new(AtomicBool::new(false));
     let quitting = Rc::new(AtomicBool::new(false));
+    let diagnostics_export_result: DiagnosticsExportResultStore = Arc::new(Mutex::new(None));
     install_system_menu(
         &frame,
         &gui_timers,
         text,
+        api.clone(),
         update_check_in_flight.clone(),
         quitting.clone(),
+        gui_tx.clone(),
+        diagnostics_export_result.clone(),
     );
     let tray_controller = tray::install(
         &frame,
@@ -849,6 +868,14 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
     ai_gw_enable_logging.set_background_color(theme::theme().bg_card_alt);
     ai_gw_enable_logging.set_foreground_color(theme::theme().ink_primary);
     ai_gw_enable_logging.set_tooltip(text.enable_request_logging_help());
+    let ai_gw_enable_log_details = CheckBox::builder(&request_logs_page)
+        .with_label(text.enable_request_log_details())
+        .with_value(false)
+        .build();
+    ai_gw_enable_log_details.set_background_color(theme::theme().bg_card_alt);
+    ai_gw_enable_log_details.set_foreground_color(theme::theme().ink_primary);
+    ai_gw_enable_log_details.set_tooltip(text.enable_request_log_details_help());
+    ai_gw_enable_log_details.enable(false);
 
     let request_log_clear_old_button = Button::builder(&request_logs_page)
         .with_label(text.request_log_clear_old())
@@ -867,6 +894,12 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
     request_log_toolbar.add_stretch_spacer(1);
     request_log_toolbar.add(
         &ai_gw_enable_logging,
+        0,
+        SizerFlag::Right | SizerFlag::AlignCenterVertical,
+        10,
+    );
+    request_log_toolbar.add(
+        &ai_gw_enable_log_details,
         0,
         SizerFlag::Right | SizerFlag::AlignCenterVertical,
         10,
@@ -1052,6 +1085,7 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         pending_ai_gw_channel_toggle,
         ai_gw_filter_image_generation,
         ai_gw_enable_logging,
+        ai_gw_enable_log_details,
         ai_gw_delete_button,
         ai_gw_new_button,
         ai_gw_edit_button,
@@ -1378,6 +1412,24 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
             schedule_dashboard_refresh(&api, &dashboard_refresh);
         });
     }
+    {
+        let api = api.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        let gui_tx = gui_tx.clone();
+        ai_gw_enable_log_details.on_toggled(move |event| {
+            let enabled = event.is_checked();
+            let worker_api = api.clone();
+            let gui_tx = gui_tx.clone();
+            thread::spawn(move || {
+                let outcome = set_request_log_details_enabled(&worker_api, enabled);
+                let _ = gui_tx.send(GuiMessage::AiGwAction(AiGwActionResult::RequestLogDetails(
+                    outcome,
+                )));
+                wxdragon::wake_up_idle();
+            });
+            schedule_dashboard_refresh(&api, &dashboard_refresh);
+        });
+    }
 
     let request_log_result: RequestLogResultStore = Arc::new(Mutex::new(None));
     let request_log_in_flight = Arc::new(AtomicBool::new(false));
@@ -1547,6 +1599,8 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let handles = handles.clone();
         let frame = frame;
         let dashboard_refresh = dashboard_refresh.clone();
+        let daemon_child_for_idle = daemon_child.clone();
+        let gui_timers_for_idle = gui_timers.clone();
         let gui_tx = gui_tx.clone();
         let im_action_in_flight = im_action_in_flight.clone();
         let ai_gw_action_in_flight = ai_gw_action_in_flight.clone();
@@ -1555,6 +1609,7 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let request_log_detail_result = request_log_detail_result.clone();
         let request_log_in_flight = request_log_in_flight.clone();
         let request_log_clear_result = request_log_clear_result.clone();
+        let diagnostics_export_result = diagnostics_export_result.clone();
         let request_logs_active = request_logs_active.clone();
         let request_log_clear_old_button = request_log_clear_old_button;
         let request_log_clear_all_button = request_log_clear_all_button;
@@ -1594,6 +1649,7 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
             {
                 force_request_log_refresh(&api, &request_log_result, &request_log_in_flight);
             }
+            apply_pending_diagnostics_export(&frame, handles.text, &diagnostics_export_result);
 
             // Drain a bounded batch of background results to keep the GUI snappy.
             let mut processed = 0;
@@ -1629,7 +1685,21 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
                                 apply_pending_ai_gw_action(&handles, &frame, result);
                             }
                             GuiMessage::DashboardUpdate => {
-                                apply_pending_dashboard(&handles, &dashboard_refresh, &api, &frame);
+                                apply_pending_dashboard(
+                                    &handles,
+                                    &dashboard_refresh,
+                                    &api,
+                                    &frame,
+                                    &daemon_child_for_idle,
+                                    &gui_timers_for_idle,
+                                );
+                            }
+                            GuiMessage::DiagnosticsExport => {
+                                apply_pending_diagnostics_export(
+                                    &frame,
+                                    handles.text,
+                                    &diagnostics_export_result,
+                                );
                             }
                         }
                     }
@@ -1861,12 +1931,166 @@ fn save_gui_theme(mode: ThemeMode) -> Result<(), String> {
     config.save(&path).map_err(|err| err.to_string())
 }
 
+fn load_outbound_proxy_config() -> OutboundProxyConfig {
+    daemon_config_path()
+        .and_then(|path| AppConfig::load_or_default(&path).ok())
+        .map(|config| config.outbound_proxy)
+        .unwrap_or_default()
+}
+
+fn save_outbound_proxy_config(
+    api: &ApiClient,
+    outbound_proxy: OutboundProxyConfig,
+) -> Result<bool, String> {
+    if let Ok(mut config) = api.get_app_config() {
+        crate::outbound_http::validate_for_local_port(&outbound_proxy, config.local_listen_port())
+            .map_err(|err| err.to_string())?;
+        config.outbound_proxy = outbound_proxy;
+        api.save_app_config(&config)?;
+        return Ok(true);
+    }
+
+    let path = daemon_config_path().unwrap_or_else(app_support_config_path);
+    let mut config = AppConfig::load_or_default(&path).map_err(|err| err.to_string())?;
+    crate::outbound_http::validate_for_local_port(&outbound_proxy, config.local_listen_port())
+        .map_err(|err| err.to_string())?;
+    config.outbound_proxy = outbound_proxy;
+    config.save(&path).map_err(|err| err.to_string())?;
+    Ok(false)
+}
+
+fn apply_outbound_blocking_proxy(
+    builder: reqwest::blocking::ClientBuilder,
+) -> Result<reqwest::blocking::ClientBuilder, String> {
+    let path = daemon_config_path().unwrap_or_else(app_support_config_path);
+    let config = AppConfig::load_or_default(&path).map_err(|err| err.to_string())?;
+    crate::outbound_http::apply_blocking_proxy(
+        builder,
+        &config.outbound_proxy,
+        config.local_listen_port(),
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn export_connection_diagnostics_async(
+    text: GuiText,
+    gui_tx: tokio_mpsc::UnboundedSender<GuiMessage>,
+    result_store: DiagnosticsExportResultStore,
+    output_path: PathBuf,
+) {
+    thread::spawn(move || {
+        let outcome = export_connection_diagnostics_now(text, &output_path);
+        if let Ok(mut slot) = result_store.lock() {
+            slot.replace(outcome);
+        }
+        let _ = gui_tx.send(GuiMessage::DiagnosticsExport);
+        wxdragon::wake_up_idle();
+    });
+}
+
+fn export_connection_diagnostics_now(text: GuiText, output_path: &Path) -> Result<PathBuf, String> {
+    let config_path = daemon_config_path().unwrap_or_else(app_support_config_path);
+    let mut config = AppConfig::load_or_default(&config_path).map_err(|err| err.to_string())?;
+    normalize_gui_config_paths(&mut config, &config_path);
+    let api = ApiClient::new(local_service_base_url(config.local_connection_mode), text);
+    let input = ConnectionDiagnosticsInput {
+        app_version: text.version().to_string(),
+        base_url: api.base_url.clone(),
+        config_path: config_path.clone(),
+        state_path: config.state_path.clone(),
+        remote_status: Some(connection_status_snapshot(
+            "/api/remote-control/status",
+            api.get_quick_json("/api/remote-control/status"),
+        )),
+        codex_app_status: Some(connection_status_snapshot(
+            "/api/codex-app/status",
+            api.get_quick_json("/api/codex-app/status"),
+        )),
+        service_status: Some(connection_status_snapshot(
+            "/api/status",
+            api.get_quick_json("/api/status"),
+        )),
+        dashboard: None,
+    };
+    export_connection_diagnostics_to_path(&input, output_path)
+        .map(|export| export.path)
+        .map_err(|err| err.to_string())
+}
+
+fn default_diagnostics_export_path() -> PathBuf {
+    default_user_export_dir().join(format!(
+        "codexhub-connection-diagnostics-{}.zip",
+        timestamp_ms()
+    ))
+}
+
+fn prompt_diagnostics_export_path(parent: &dyn WxWidget, text: GuiText) -> Option<PathBuf> {
+    let default_path = default_diagnostics_export_path();
+    let default_dir = default_path
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let default_file = default_path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "codexhub-connection-diagnostics.zip".to_string());
+    let dialog = FileDialog::builder(parent)
+        .with_message(text.diagnostics_export_save_dialog_title())
+        .with_default_dir(&default_dir)
+        .with_default_file(&default_file)
+        .with_wildcard(text.diagnostics_export_zip_wildcard())
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return None;
+    }
+    dialog.get_path().map(PathBuf::from)
+}
+
+fn default_user_export_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    home.as_ref()
+        .map(|home| home.join("Desktop"))
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            home.as_ref()
+                .map(|home| home.join("Downloads"))
+                .filter(|path| path.is_dir())
+        })
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn normalize_gui_config_paths(config: &mut AppConfig, config_path: &Path) {
+    let base = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    if config.state_path.is_relative() {
+        config.state_path = base.join(&config.state_path);
+    }
+}
+
 fn install_system_menu(
     frame: &Frame,
     gui_timers: &GuiTimers,
     text: GuiText,
+    api: ApiClient,
     update_check_in_flight: Arc<AtomicBool>,
     quitting: Rc<AtomicBool>,
+    gui_tx: tokio_mpsc::UnboundedSender<GuiMessage>,
+    diagnostics_export_result: DiagnosticsExportResultStore,
 ) {
     let file_menu = Menu::builder()
         .append_item(
@@ -1913,11 +2137,46 @@ fn install_system_menu(
     theme_menu.check_item(ID_MENU_THEME_SYSTEM, theme_mode == ThemeMode::System);
     theme_menu.check_item(ID_MENU_THEME_LIGHT, theme_mode == ThemeMode::Light);
     theme_menu.check_item(ID_MENU_THEME_DARK, theme_mode == ThemeMode::Dark);
+    let outbound_proxy = load_outbound_proxy_config();
+    let network_menu = Menu::builder()
+        .append_radio_item(
+            ID_MENU_PROXY_SYSTEM,
+            text.outbound_proxy_system(),
+            text.outbound_proxy_system_help(),
+        )
+        .append_radio_item(
+            ID_MENU_PROXY_DIRECT,
+            text.outbound_proxy_direct(),
+            text.outbound_proxy_direct_help(),
+        )
+        .append_radio_item(
+            ID_MENU_PROXY_CUSTOM,
+            text.outbound_proxy_custom(),
+            text.outbound_proxy_custom_help(),
+        )
+        .build();
+    network_menu.check_item(
+        ID_MENU_PROXY_SYSTEM,
+        outbound_proxy.mode == OutboundProxyMode::System,
+    );
+    network_menu.check_item(
+        ID_MENU_PROXY_DIRECT,
+        outbound_proxy.mode == OutboundProxyMode::Direct,
+    );
+    network_menu.check_item(
+        ID_MENU_PROXY_CUSTOM,
+        outbound_proxy.mode == OutboundProxyMode::Custom,
+    );
     let help_menu = Menu::builder()
         .append_item(
             ID_MENU_CHECK_UPDATE,
             text.check_updates(),
             text.check_updates_help(),
+        )
+        .append_item(
+            ID_MENU_EXPORT_CONNECTION_DIAGNOSTICS,
+            text.export_connection_diagnostics(),
+            text.export_connection_diagnostics_help(),
         )
         .append_separator()
         .append_item(ID_ABOUT, text.about(), "About Codex Remote Gateway")
@@ -1926,6 +2185,7 @@ fn install_system_menu(
         .append(file_menu, text.file_menu())
         .append(language_menu, text.language_menu())
         .append(theme_menu, text.theme_menu())
+        .append(network_menu, text.network_menu())
         .append(help_menu, text.help_menu())
         .build();
     frame.set_menu_bar(menu_bar);
@@ -1945,6 +2205,16 @@ fn install_system_menu(
                 &quitting,
             );
         }
+        ID_MENU_EXPORT_CONNECTION_DIAGNOSTICS => {
+            if let Some(output_path) = prompt_diagnostics_export_path(&frame, text) {
+                export_connection_diagnostics_async(
+                    text,
+                    gui_tx.clone(),
+                    diagnostics_export_result.clone(),
+                    output_path,
+                );
+            }
+        }
         ID_MENU_LANGUAGE_ZH_CN => {
             handle_language_selected(&frame, text, GuiLocale::ZhCn);
         }
@@ -1954,6 +2224,15 @@ fn install_system_menu(
         ID_MENU_THEME_SYSTEM => handle_theme_selected(&frame, text, ThemeMode::System),
         ID_MENU_THEME_LIGHT => handle_theme_selected(&frame, text, ThemeMode::Light),
         ID_MENU_THEME_DARK => handle_theme_selected(&frame, text, ThemeMode::Dark),
+        ID_MENU_PROXY_SYSTEM => {
+            handle_outbound_proxy_selected(&frame, text, &api, OutboundProxyMode::System)
+        }
+        ID_MENU_PROXY_DIRECT => {
+            handle_outbound_proxy_selected(&frame, text, &api, OutboundProxyMode::Direct)
+        }
+        ID_MENU_PROXY_CUSTOM => {
+            handle_outbound_proxy_selected(&frame, text, &api, OutboundProxyMode::Custom)
+        }
         ID_ABOUT => show_about_dialog(&frame),
         _ => event.skip(true),
     });
@@ -2105,6 +2384,13 @@ fn show_ai_gw_channel_dialog(
         text.ai_gw_service_openai(),
         Some(ProviderLogoKind::OpenAi),
         true,
+    );
+    let radio_grok = ai_gw_service_option(
+        &service_panel,
+        &service_sizer,
+        text.ai_gw_service_grok(),
+        Some(ProviderLogoKind::Grok),
+        false,
     );
     let radio_deepseek = ai_gw_service_option(
         &service_panel,
@@ -2297,6 +2583,7 @@ fn show_ai_gw_channel_dialog(
         text,
         initial,
         &radio_openai,
+        &radio_grok,
         &radio_deepseek,
         &radio_anthropic,
         &radio_glm,
@@ -2325,6 +2612,7 @@ fn show_ai_gw_channel_dialog(
             provider.provider_type.clone(),
             provider.compatibility.as_deref().map(ToOwned::to_owned),
             &radio_openai,
+            &radio_grok,
             &radio_deepseek,
             &radio_anthropic,
             &radio_glm,
@@ -2351,6 +2639,45 @@ fn show_ai_gw_channel_dialog(
                     text,
                     provider.clone(),
                     &radio_openai,
+                    &radio_grok,
+                    &radio_deepseek,
+                    &radio_anthropic,
+                    &radio_glm,
+                    &type_input,
+                    &name_input,
+                    &base_url_input,
+                    &models_url_input,
+                    &key_input,
+                    &models_list,
+                    &model_mapping_rows,
+                    &model_mapping_model,
+                    &weight_input,
+                    &service_template_applying,
+                );
+                *current_ai_gw_provider_template.borrow_mut() = provider;
+            }
+        });
+    }
+    if initial.is_none() {
+        let type_input = type_input;
+        let name_input = name_input;
+        let base_url_input = base_url_input;
+        let models_url_input = models_url_input;
+        let key_input = key_input;
+        let models_list = models_list;
+        let model_mapping_rows = model_mapping_rows.clone();
+        let model_mapping_model = model_mapping_model.clone();
+        let weight_input = weight_input;
+        let service_template_applying = service_template_applying.clone();
+        let current_ai_gw_provider_template = current_ai_gw_provider_template.clone();
+        radio_grok.on_selected(move |_| {
+            if radio_grok.get_value() && !*service_template_applying.borrow() {
+                let provider = default_ai_gw_service_provider(ProviderType::GrokResponses);
+                apply_ai_gw_service_template(
+                    text,
+                    provider.clone(),
+                    &radio_openai,
+                    &radio_grok,
                     &radio_deepseek,
                     &radio_anthropic,
                     &radio_glm,
@@ -2388,6 +2715,7 @@ fn show_ai_gw_channel_dialog(
                     text,
                     provider.clone(),
                     &radio_openai,
+                    &radio_grok,
                     &radio_deepseek,
                     &radio_anthropic,
                     &radio_glm,
@@ -2425,6 +2753,7 @@ fn show_ai_gw_channel_dialog(
                     text,
                     provider.clone(),
                     &radio_openai,
+                    &radio_grok,
                     &radio_deepseek,
                     &radio_anthropic,
                     &radio_glm,
@@ -2462,6 +2791,7 @@ fn show_ai_gw_channel_dialog(
                     text,
                     provider.clone(),
                     &radio_openai,
+                    &radio_grok,
                     &radio_deepseek,
                     &radio_anthropic,
                     &radio_glm,
@@ -2674,6 +3004,7 @@ fn show_ai_gw_channel_dialog(
                 .map(|provider| provider.provider_type.clone())
                 .unwrap_or_else(|| {
                     selected_ai_gw_dialog_provider_type(
+                        &radio_grok,
                         &radio_deepseek,
                         &radio_anthropic,
                         &radio_glm,
@@ -2728,6 +3059,7 @@ fn apply_ai_gw_dialog_template(
     text: GuiText,
     provider: Option<&ProviderConfig>,
     radio_openai: &RadioButton,
+    radio_grok: &RadioButton,
     radio_deepseek: &RadioButton,
     radio_anthropic: &RadioButton,
     radio_glm: &RadioButton,
@@ -2751,6 +3083,7 @@ fn apply_ai_gw_dialog_template(
         provider.provider_type.clone(),
         provider.compatibility.as_deref(),
         radio_openai,
+        radio_grok,
         radio_deepseek,
         radio_anthropic,
         radio_glm,
@@ -2773,6 +3106,7 @@ fn apply_ai_gw_service_template(
     text: GuiText,
     provider: ProviderConfig,
     radio_openai: &RadioButton,
+    radio_grok: &RadioButton,
     radio_deepseek: &RadioButton,
     radio_anthropic: &RadioButton,
     radio_glm: &RadioButton,
@@ -2792,6 +3126,7 @@ fn apply_ai_gw_service_template(
         text,
         Some(&provider),
         radio_openai,
+        radio_grok,
         radio_deepseek,
         radio_anthropic,
         radio_glm,
@@ -2813,6 +3148,7 @@ fn bind_locked_ai_gw_service_selection(
     provider_type: ProviderType,
     compatibility: Option<String>,
     radio_openai: &RadioButton,
+    radio_grok: &RadioButton,
     radio_deepseek: &RadioButton,
     radio_anthropic: &RadioButton,
     radio_glm: &RadioButton,
@@ -2825,6 +3161,20 @@ fn bind_locked_ai_gw_service_selection(
         compatibility.clone(),
         radio_openai,
         radio_openai,
+        radio_grok,
+        radio_deepseek,
+        radio_anthropic,
+        radio_glm,
+        type_input,
+        service_template_applying.clone(),
+    );
+    bind_locked_ai_gw_service_radio(
+        text,
+        provider_type.clone(),
+        compatibility.clone(),
+        radio_grok,
+        radio_openai,
+        radio_grok,
         radio_deepseek,
         radio_anthropic,
         radio_glm,
@@ -2837,6 +3187,7 @@ fn bind_locked_ai_gw_service_selection(
         compatibility.clone(),
         radio_deepseek,
         radio_openai,
+        radio_grok,
         radio_deepseek,
         radio_anthropic,
         radio_glm,
@@ -2849,6 +3200,7 @@ fn bind_locked_ai_gw_service_selection(
         compatibility.clone(),
         radio_anthropic,
         radio_openai,
+        radio_grok,
         radio_deepseek,
         radio_anthropic,
         radio_glm,
@@ -2861,6 +3213,7 @@ fn bind_locked_ai_gw_service_selection(
         compatibility,
         radio_glm,
         radio_openai,
+        radio_grok,
         radio_deepseek,
         radio_anthropic,
         radio_glm,
@@ -2875,6 +3228,7 @@ fn bind_locked_ai_gw_service_radio(
     compatibility: Option<String>,
     radio: &RadioButton,
     radio_openai: &RadioButton,
+    radio_grok: &RadioButton,
     radio_deepseek: &RadioButton,
     radio_anthropic: &RadioButton,
     radio_glm: &RadioButton,
@@ -2883,6 +3237,7 @@ fn bind_locked_ai_gw_service_radio(
 ) {
     let radio = *radio;
     let radio_openai = *radio_openai;
+    let radio_grok = *radio_grok;
     let radio_deepseek = *radio_deepseek;
     let radio_anthropic = *radio_anthropic;
     let radio_glm = *radio_glm;
@@ -2897,6 +3252,7 @@ fn bind_locked_ai_gw_service_radio(
             provider_type.clone(),
             compatibility.as_deref(),
             &radio_openai,
+            &radio_grok,
             &radio_deepseek,
             &radio_anthropic,
             &radio_glm,
@@ -2912,6 +3268,12 @@ fn default_ai_gw_service_provider(provider_type: ProviderType) -> ProviderConfig
             name: "openai".to_string(),
             provider_type: ProviderType::OpenAiResponses,
             base_url: "https://api.openai.com/v1".to_string(),
+            ..Default::default()
+        },
+        ProviderType::GrokResponses => ProviderConfig {
+            name: "grok".to_string(),
+            provider_type: ProviderType::GrokResponses,
+            base_url: "https://api.x.ai/v1".to_string(),
             ..Default::default()
         },
         ProviderType::ChatCompletions => ProviderConfig {
@@ -2986,12 +3348,14 @@ fn set_ai_gw_dialog_provider_type(
     provider_type: ProviderType,
     compatibility: Option<&str>,
     radio_openai: &RadioButton,
+    radio_grok: &RadioButton,
     radio_deepseek: &RadioButton,
     radio_anthropic: &RadioButton,
     radio_glm: &RadioButton,
     type_input: &TextCtrl,
 ) {
     radio_openai.set_value(false);
+    radio_grok.set_value(false);
     radio_deepseek.set_value(false);
     radio_anthropic.set_value(false);
     radio_glm.set_value(false);
@@ -3003,6 +3367,10 @@ fn set_ai_gw_dialog_provider_type(
         ProviderType::OpenAiResponses => {
             radio_openai.set_value(true);
             type_input.change_value(text.provider_type_openai_responses());
+        }
+        ProviderType::GrokResponses => {
+            radio_grok.set_value(true);
+            type_input.change_value(text.provider_type_grok_responses());
         }
         ProviderType::AnthropicMessages => {
             if matches!(compatibility, Some("glm_anthropic" | "zhipu_anthropic")) {
@@ -3030,12 +3398,15 @@ fn selected_ai_gw_dialog_compatibility(
 }
 
 fn selected_ai_gw_dialog_provider_type(
+    radio_grok: &RadioButton,
     radio_deepseek: &RadioButton,
     radio_anthropic: &RadioButton,
     radio_glm: &RadioButton,
 ) -> ProviderType {
     if radio_anthropic.get_value() || radio_glm.get_value() {
         ProviderType::AnthropicMessages
+    } else if radio_grok.get_value() {
+        ProviderType::GrokResponses
     } else if radio_deepseek.get_value() {
         ProviderType::ChatCompletions
     } else {
@@ -3298,24 +3669,27 @@ fn with_inferred_model_aliases(
 fn inferred_model_aliases(models: &[String]) -> BTreeMap<String, String> {
     let mut aliases = BTreeMap::new();
     for model in models {
-        let canonical = canonical_model_alias_key(model);
-        if canonical != model.as_str() && models.iter().all(|item| item != &canonical) {
+        let Some(canonical) = inferred_model_alias_key(model) else {
+            continue;
+        };
+        if models.iter().all(|item| item != &canonical) {
             aliases.insert(canonical, model.clone());
         }
     }
     aliases
 }
 
-fn canonical_model_alias_key(model: &str) -> String {
+fn inferred_model_alias_key(model: &str) -> Option<String> {
     match model.trim().to_ascii_lowercase().as_str() {
-        "claude-opus-4-8" => "opus-4.8".to_string(),
-        "claude-sonnet-4-6" => "sonnet-4.6".to_string(),
-        model => model.to_string(),
+        "claude-opus-4-8" => Some("opus-4.8".to_string()),
+        "claude-sonnet-4-6" => Some("sonnet-4.6".to_string()),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod model_mapping_tests {
+    use super::api::RemoteControlConnectionStatus;
     use super::*;
 
     #[test]
@@ -3352,6 +3726,26 @@ mod model_mapping_tests {
     }
 
     #[test]
+    fn does_not_infer_generic_lowercase_model_aliases() {
+        let models = vec![
+            "zai-org/GLM-5.2".to_string(),
+            "moonshotai/Kimi-K2.7-Code".to_string(),
+            "deepseek-ai/DeepSeek-V4-Pro".to_string(),
+        ];
+
+        assert!(inferred_model_aliases(&models).is_empty());
+
+        let rows = model_mapping_rows_from_config(&models, &BTreeMap::new());
+        assert_eq!(rows[0].upstream_model, "zai-org/GLM-5.2");
+        assert!(rows[0].codex_models.is_empty());
+        assert!(rows[1].codex_models.is_empty());
+        assert!(rows[2].codex_models.is_empty());
+
+        let saved_aliases = build_model_aliases_for_save(&models, BTreeMap::new());
+        assert!(saved_aliases.is_empty());
+    }
+
+    #[test]
     fn min_frame_size_never_exceeds_actual_frame() {
         // On a tiny window the floor must shrink with it, otherwise the min-size
         // constraint would itself force off-screen content.
@@ -3366,6 +3760,220 @@ mod model_mapping_tests {
         assert_eq!(floor.width, MIN_FRAME_WIDTH);
         assert_eq!(floor.height, MIN_FRAME_HEIGHT);
     }
+
+    #[test]
+    fn codex_app_status_ignores_unknown_connection_initialization() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: false,
+            active_source_kind: None,
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: false,
+                source_kind: "unknown".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "codex_app", true),
+            EndpointStatusState::NotConnected
+        );
+    }
+
+    #[test]
+    fn codex_app_status_does_not_claim_unknown_active_connection() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: true,
+            active_source_kind: Some("unknown".to_string()),
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: true,
+                source_kind: "unknown".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "codex_app", true),
+            EndpointStatusState::NotConnected
+        );
+    }
+
+    #[test]
+    fn endpoint_status_is_uninitialized_when_not_configured() {
+        assert_eq!(
+            endpoint_status_state(
+                Some(&RemoteControlStatus {
+                    connected: false,
+                    initialized: false,
+                    active_source_kind: None,
+                    connections: vec![],
+                }),
+                "codex_app",
+                false
+            ),
+            EndpointStatusState::UninitializedConfig
+        );
+    }
+
+    #[test]
+    fn endpoint_status_is_loading_when_remote_snapshot_is_missing() {
+        assert_eq!(
+            endpoint_status_state(None, "codex_app", true),
+            EndpointStatusState::Loading
+        );
+    }
+
+    #[test]
+    fn endpoint_status_is_not_connected_when_configured_without_source_connection() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: true,
+            active_source_kind: Some("codex_app".to_string()),
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: true,
+                source_kind: "codex_app".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "vscode", true),
+            EndpointStatusState::NotConnected
+        );
+    }
+
+    #[test]
+    fn endpoint_status_keeps_codex_app_vscode_and_cli_independent() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: true,
+            active_source_kind: Some("vscode".to_string()),
+            connections: vec![
+                RemoteControlConnectionStatus {
+                    connected: true,
+                    initialized: false,
+                    source_kind: "codex_app".to_string(),
+                },
+                RemoteControlConnectionStatus {
+                    connected: true,
+                    initialized: true,
+                    source_kind: "vscode".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "codex_app", true),
+            EndpointStatusState::Connected
+        );
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "vscode", true),
+            EndpointStatusState::Connected
+        );
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "cli", true),
+            EndpointStatusState::NotConnected
+        );
+    }
+
+    #[test]
+    fn endpoint_status_uninitialized_source_is_connected_when_channel_is_open() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: false,
+            active_source_kind: None,
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: false,
+                source_kind: "vscode".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "vscode", true),
+            EndpointStatusState::Connected
+        );
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "cli", true),
+            EndpointStatusState::NotConnected
+        );
+    }
+
+    #[test]
+    fn endpoint_status_connected_takes_priority_over_config_state() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: true,
+            active_source_kind: Some("codex_app".to_string()),
+            connections: vec![],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "codex_app", false),
+            EndpointStatusState::Connected
+        );
+    }
+
+    #[test]
+    fn endpoint_status_labels_are_unified_for_zh_cn() {
+        let text = GuiText::new(GuiLocale::ZhCn);
+
+        assert_eq!(
+            endpoint_status_label(text, EndpointStatusState::UninitializedConfig),
+            "未初始化配置"
+        );
+        assert_eq!(
+            endpoint_status_label(text, EndpointStatusState::NotConnected),
+            "未连接"
+        );
+        assert_eq!(
+            endpoint_status_label(text, EndpointStatusState::Connected),
+            "已连接"
+        );
+        assert_eq!(
+            endpoint_status_label(text, EndpointStatusState::Loading),
+            "读取中"
+        );
+    }
+
+    #[test]
+    fn codex_app_status_is_connected_for_open_uninitialized_channel() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: false,
+            active_source_kind: None,
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: false,
+                source_kind: "codex_app".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "codex_app", true),
+            EndpointStatusState::Connected
+        );
+    }
+
+    #[test]
+    fn vscode_status_is_not_connected_when_only_codex_app_is_connected() {
+        let remote = RemoteControlStatus {
+            connected: true,
+            initialized: true,
+            active_source_kind: Some("codex_app".to_string()),
+            connections: vec![RemoteControlConnectionStatus {
+                connected: true,
+                initialized: true,
+                source_kind: "codex_app".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            endpoint_status_state(Some(&remote), "vscode", true),
+            EndpointStatusState::NotConnected
+        );
+    }
 }
 
 fn fetch_remote_models(
@@ -3376,11 +3984,13 @@ fn fetch_remote_models(
     timeout_secs: u64,
 ) -> Result<(Vec<String>, String), String> {
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|err| err.to_string())?;
+    let client = apply_outbound_blocking_proxy(
+        reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(5)),
+    )?
+    .build()
+    .map_err(|err| err.to_string())?;
     let mut errors = Vec::new();
     for candidate in model_list_candidates(base_url, models_url, fallback_models_url) {
         let mut request = client.get(&candidate.url);
@@ -3560,6 +4170,67 @@ fn handle_theme_selected(frame: &Frame, text: GuiText, mode: ThemeMode) {
     }
 }
 
+fn handle_outbound_proxy_selected(
+    frame: &Frame,
+    text: GuiText,
+    api: &ApiClient,
+    mode: OutboundProxyMode,
+) {
+    let mut config = load_outbound_proxy_config();
+    let previous_mode = config.mode;
+    if mode == OutboundProxyMode::Custom {
+        let input = TextEntryDialog::builder(
+            frame,
+            text.outbound_proxy_prompt(),
+            text.outbound_proxy_custom(),
+        )
+        .with_default_value(&config.url)
+        .with_style(
+            TextEntryDialogStyle::Ok | TextEntryDialogStyle::Cancel | TextEntryDialogStyle::Centre,
+        )
+        .build();
+        if input.show_modal() != ID_OK {
+            sync_outbound_proxy_menu(frame, previous_mode);
+            return;
+        }
+        let Some(value) = input.get_value() else {
+            sync_outbound_proxy_menu(frame, previous_mode);
+            return;
+        };
+        config.url = value.trim().to_string();
+    }
+    config.mode = mode;
+
+    match save_outbound_proxy_config(api, config) {
+        Ok(applied_live) => {
+            sync_outbound_proxy_menu(frame, mode);
+            show_info(
+                frame,
+                if applied_live {
+                    text.outbound_proxy_applied_message()
+                } else {
+                    text.outbound_proxy_restart_message()
+                },
+            );
+        }
+        Err(err) => {
+            sync_outbound_proxy_menu(frame, previous_mode);
+            show_error(
+                frame,
+                &format!("{}: {err}", text.outbound_proxy_save_failed()),
+            );
+        }
+    }
+}
+
+fn sync_outbound_proxy_menu(frame: &Frame, mode: OutboundProxyMode) {
+    if let Some(menu_bar) = frame.get_menu_bar() {
+        menu_bar.check_item(ID_MENU_PROXY_SYSTEM, mode == OutboundProxyMode::System);
+        menu_bar.check_item(ID_MENU_PROXY_DIRECT, mode == OutboundProxyMode::Direct);
+        menu_bar.check_item(ID_MENU_PROXY_CUSTOM, mode == OutboundProxyMode::Custom);
+    }
+}
+
 fn bind_service_connection_settings(frame: &Frame, handles: &UiHandles) {
     let button = handles.service_settings_button;
     let text = handles.text;
@@ -3631,6 +4302,7 @@ struct UiHandles {
     pending_ai_gw_channel_toggle: PendingAiGwChannelToggle,
     ai_gw_filter_image_generation: CheckBox,
     ai_gw_enable_logging: CheckBox,
+    ai_gw_enable_log_details: CheckBox,
     ai_gw_delete_button: Button,
     ai_gw_new_button: Button,
     ai_gw_edit_button: Button,
@@ -3647,6 +4319,8 @@ struct DashboardRefresh {
     result: Arc<Mutex<Option<(u64, DashboardSnapshot)>>>,
     last_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
     daemon_starting: Arc<AtomicBool>,
+    daemon_health_failures: Arc<AtomicU64>,
+    daemon_restart_not_before_ms: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     closing: Arc<AtomicBool>,
     connection_prompt_shown: Arc<AtomicBool>,
@@ -3662,6 +4336,8 @@ impl DashboardRefresh {
             result: Arc::new(Mutex::new(None)),
             last_snapshot: Arc::new(Mutex::new(None)),
             daemon_starting: Arc::new(AtomicBool::new(false)),
+            daemon_health_failures: Arc::new(AtomicU64::new(0)),
+            daemon_restart_not_before_ms: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
             closing: Arc::new(AtomicBool::new(false)),
             connection_prompt_shown: Arc::new(AtomicBool::new(false)),
@@ -3827,6 +4503,8 @@ fn apply_pending_dashboard(
     refresh: &DashboardRefresh,
     api: &ApiClient,
     frame: &Frame,
+    daemon_child: &Rc<RefCell<Option<Child>>>,
+    gui_timers: &GuiTimers,
 ) -> bool {
     let result = refresh.result.lock().ok().and_then(|mut slot| slot.take());
     let Some((generation, snapshot)) = result else {
@@ -3839,10 +4517,80 @@ fn apply_pending_dashboard(
     let daemon_starting = refresh.daemon_starting.load(Ordering::SeqCst);
     update_dashboard(handles, &snapshot, daemon_starting);
     maybe_prompt_compatible_connection(handles, refresh, api, frame, &snapshot, daemon_starting);
+    maybe_restart_unhealthy_daemon(
+        handles,
+        refresh,
+        api,
+        frame,
+        daemon_child,
+        gui_timers,
+        &snapshot,
+        daemon_starting,
+    );
     if let Ok(mut last_snapshot) = refresh.last_snapshot.lock() {
         last_snapshot.replace(snapshot);
     }
     true
+}
+
+fn maybe_restart_unhealthy_daemon(
+    handles: &UiHandles,
+    refresh: &DashboardRefresh,
+    api: &ApiClient,
+    frame: &Frame,
+    daemon_child: &Rc<RefCell<Option<Child>>>,
+    gui_timers: &GuiTimers,
+    snapshot: &DashboardSnapshot,
+    daemon_starting: bool,
+) {
+    if snapshot.service_online {
+        refresh.daemon_health_failures.store(0, Ordering::SeqCst);
+        return;
+    }
+    if daemon_starting || refresh.closing.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let failures = refresh
+        .daemon_health_failures
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let now = now_ms().min(u64::MAX as u128) as u64;
+    let not_before = refresh.daemon_restart_not_before_ms.load(Ordering::SeqCst);
+    if !daemon_auto_restart_ready(failures, now, not_before) {
+        return;
+    }
+    let next_restart_at = now.saturating_add(DAEMON_AUTO_RESTART_COOLDOWN_MS);
+    if refresh
+        .daemon_restart_not_before_ms
+        .compare_exchange(
+            not_before,
+            next_restart_at,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    refresh.daemon_health_failures.store(0, Ordering::SeqCst);
+    start_daemon_for_gui_async(api, handles, frame, daemon_child, refresh, gui_timers);
+}
+
+fn daemon_auto_restart_ready(failures: u64, now_ms: u64, not_before_ms: u64) -> bool {
+    failures >= DAEMON_AUTO_RESTART_FAILURE_THRESHOLD && now_ms >= not_before_ms
+}
+
+#[cfg(test)]
+mod daemon_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_restart_requires_failure_threshold_and_cooldown() {
+        assert!(!daemon_auto_restart_ready(2, 100, 0));
+        assert!(!daemon_auto_restart_ready(3, 99, 100));
+        assert!(daemon_auto_restart_ready(3, 100, 100));
+    }
 }
 
 fn cached_dashboard_snapshot(refresh: &DashboardRefresh) -> Option<DashboardSnapshot> {
@@ -4061,7 +4809,11 @@ fn update_dashboard(handles: &UiHandles, snapshot: &DashboardSnapshot, daemon_st
     }
     if let Some(gw) = &snapshot.ai_gateway {
         refresh_ai_gw_filter_image_generation(handles, gw.filter_image_generation_tool);
-        refresh_ai_gw_enable_logging(handles, gw.request_logging_enabled);
+        refresh_ai_gw_enable_logging(
+            handles,
+            gw.request_logging_enabled,
+            gw.request_log_details_enabled,
+        );
     }
 
     if let Some(status) = &snapshot.status {
@@ -4078,33 +4830,22 @@ fn update_dashboard(handles: &UiHandles, snapshot: &DashboardSnapshot, daemon_st
 
     refresh_im_account_list(handles, snapshot);
 
-    let remote_connected = snapshot
-        .remote
-        .as_ref()
-        .map(|remote| remote.connected)
-        .unwrap_or(false);
-    let remote_initialized = snapshot
-        .remote
-        .as_ref()
-        .map(|remote| remote.initialized)
-        .unwrap_or(false);
     let remote_status = snapshot.remote.as_ref();
-    let codex_app_remote_ready = remote_connection_ready(remote_status, "codex_app")
-        || remote_active_ready(remote_status, "codex_app");
-    let vscode_remote_ready = remote_connection_ready(remote_status, "vscode")
-        || remote_active_ready(remote_status, "vscode");
-    let cli_remote_ready =
-        remote_connection_ready(remote_status, "cli") || remote_active_ready(remote_status, "cli");
-    codex_tab::refresh_remote_ready(
-        &handles.codex_tab,
-        codex_app_remote_ready || vscode_remote_ready || cli_remote_ready,
-    );
-    let remote_initializing = remote_connected && !remote_initialized;
     let codex_configured = snapshot
         .codex_app
         .as_ref()
         .map(|status| status.configured)
         .unwrap_or(false);
+    let codex_app_status_state =
+        endpoint_status_state(remote_status, "codex_app", codex_configured);
+    let vscode_status_state = endpoint_status_state(remote_status, "vscode", true);
+    let cli_status_state = endpoint_status_state(remote_status, "cli", true);
+    codex_tab::refresh_remote_ready(
+        &handles.codex_tab,
+        codex_app_status_state == EndpointStatusState::Connected
+            || vscode_status_state == EndpointStatusState::Connected
+            || cli_status_state == EndpointStatusState::Connected,
+    );
 
     if CODEX_APP_GUI_UNSUPPORTED {
         set_disabled_status_panel(
@@ -4112,47 +4853,12 @@ fn update_dashboard(handles: &UiHandles, snapshot: &DashboardSnapshot, daemon_st
             text.unavailable(),
             text.app_gui_unsupported(),
         );
-    } else if codex_app_remote_ready {
-        set_status_panel(&handles.codex_status, text.connected(), "", StateTone::Ok);
-    } else if remote_initializing {
-        set_status_panel(
-            &handles.codex_status,
-            text.initializing(),
-            "",
-            StateTone::Warn,
-        );
-    } else if codex_configured {
-        set_status_panel(
-            &handles.codex_status,
-            text.control_not_open(),
-            "",
-            StateTone::Warn,
-        );
     } else {
-        set_status_panel(
-            &handles.codex_status,
-            text.not_injected(),
-            "",
-            StateTone::Warn,
-        );
+        set_endpoint_status_panel(&handles.codex_status, text, codex_app_status_state);
     }
 
-    if vscode_remote_ready {
-        set_status_panel(&handles.vscode_status, text.connected(), "", StateTone::Ok);
-    } else {
-        set_status_panel(
-            &handles.vscode_status,
-            text.can_connect(),
-            "",
-            StateTone::Warn,
-        );
-    }
-
-    if cli_remote_ready {
-        set_status_panel(&handles.cli_status, text.connected(), "", StateTone::Ok);
-    } else {
-        set_status_panel(&handles.cli_status, text.can_connect(), "", StateTone::Warn);
-    }
+    set_endpoint_status_panel(&handles.vscode_status, text, vscode_status_state);
+    set_endpoint_status_panel(&handles.cli_status, text, cli_status_state);
 
     // AI Gateway status
     if let Some(gw) = &snapshot.ai_gateway {
@@ -4325,23 +5031,88 @@ fn apply_pending_request_log_clear(
     }
 }
 
-fn remote_connection_ready(remote: Option<&RemoteControlStatus>, source_kind: &str) -> bool {
+fn apply_pending_diagnostics_export(
+    frame: &Frame,
+    text: GuiText,
+    result_store: &DiagnosticsExportResultStore,
+) {
+    let result = result_store.lock().ok().and_then(|mut slot| slot.take());
+    let Some(result) = result else {
+        return;
+    };
+    match result {
+        Ok(_path) => {}
+        Err(err) => show_error(frame, &text.diagnostics_export_failed(&err)),
+    }
+}
+
+fn remote_source_connected(remote: Option<&RemoteControlStatus>, source_kind: &str) -> bool {
     remote
         .map(|remote| {
-            remote.connections.iter().any(|connection| {
-                connection.source_kind == source_kind
-                    && connection.connected
-                    && connection.initialized
-            })
+            remote
+                .connections
+                .iter()
+                .any(|connection| connection.source_kind == source_kind && connection.connected)
         })
         .unwrap_or(false)
 }
 
-fn remote_active_ready(remote: Option<&RemoteControlStatus>, source_kind: &str) -> bool {
+fn remote_active_connected(remote: Option<&RemoteControlStatus>, source_kind: &str) -> bool {
     remote
-        .filter(|remote| remote.connected && remote.initialized)
+        .filter(|remote| remote.connected)
         .and_then(|remote| remote.active_source_kind.as_deref())
         == Some(source_kind)
+}
+
+fn endpoint_status_state(
+    remote: Option<&RemoteControlStatus>,
+    source_kind: &str,
+    configured: bool,
+) -> EndpointStatusState {
+    if remote.is_none() {
+        EndpointStatusState::Loading
+    } else if remote_source_connected(remote, source_kind)
+        || remote_active_connected(remote, source_kind)
+    {
+        EndpointStatusState::Connected
+    } else if !configured {
+        EndpointStatusState::UninitializedConfig
+    } else {
+        EndpointStatusState::NotConnected
+    }
+}
+
+fn set_endpoint_status_panel(panel: &StatusPanel, text: GuiText, state: EndpointStatusState) {
+    let label = endpoint_status_label(text, state);
+    let tone = endpoint_status_tone(state);
+    set_status_panel(panel, label, "", tone);
+}
+
+fn endpoint_status_label(text: GuiText, state: EndpointStatusState) -> &'static str {
+    match state {
+        EndpointStatusState::Connected => text.connected(),
+        EndpointStatusState::Loading => text.reading(),
+        EndpointStatusState::NotConnected => text.not_connected(),
+        EndpointStatusState::UninitializedConfig => text.uninitialized_config(),
+    }
+}
+
+fn endpoint_status_tone(state: EndpointStatusState) -> StateTone {
+    match state {
+        EndpointStatusState::Connected => StateTone::Ok,
+        EndpointStatusState::Loading => StateTone::Muted,
+        EndpointStatusState::NotConnected | EndpointStatusState::UninitializedConfig => {
+            StateTone::Warn
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointStatusState {
+    Connected,
+    Loading,
+    NotConnected,
+    UninitializedConfig,
 }
 
 fn show_about_dialog(parent: &Frame) {

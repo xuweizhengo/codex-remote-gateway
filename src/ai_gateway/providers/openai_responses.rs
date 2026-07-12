@@ -7,12 +7,13 @@ use futures_util::StreamExt;
 use serde_json::json;
 use tracing::{debug, error};
 
-use crate::ai_gateway::config::{ProviderConfig, provider_api_root};
+use crate::ai_gateway::config::{ProviderConfig, ProviderType, provider_api_root};
 use crate::ai_gateway::context::{GatewayContext, apply_upstream_headers};
 use crate::ai_gateway::error::GatewayError;
 use crate::ai_gateway::request_log::{
     self, RequestLogContext, RequestLogUpdate, ResponsesSseLogStream, UpstreamSseCaptureStream,
 };
+use crate::ai_gateway::responses_compat::{ResponsesCompatSseStream, normalize_json_body};
 
 use super::{
     apply_total_request_timeout, ensure_success_response, execute_stream_start,
@@ -44,6 +45,7 @@ pub async fn passthrough(
         }
     }
     raw_body["model"] = json!(upstream_model);
+    normalize_grok_reasoning_replay(&mut raw_body, provider);
 
     let is_stream = raw_body
         .get("stream")
@@ -71,9 +73,15 @@ pub async fn passthrough(
 
     if let Some(log_context) = &log_context {
         let update = RequestLogUpdate {
-            upstream_request_headers_json: request_log::headers_to_json(upstream_req.headers()),
+            upstream_request_headers_json: log_context
+                .details_enabled
+                .then(|| request_log::headers_to_json(upstream_req.headers()))
+                .flatten(),
             upstream_request_body_bytes: request_log::json_body_size_bytes(&raw_body),
-            upstream_request_json: serde_json::to_string(&raw_body).ok(),
+            upstream_request_json: log_context
+                .details_enabled
+                .then(|| serde_json::to_string(&raw_body).ok())
+                .flatten(),
             ..RequestLogUpdate::default()
         };
         if let Err(err) = log_context.store.update_record(log_context.log_id, &update) {
@@ -127,12 +135,13 @@ pub async fn passthrough(
         });
         let body = if let Some(log_context) = log_context {
             let captured_upstream = UpstreamSseCaptureStream::new(byte_stream, log_context.clone());
+            let compat_stream = ResponsesCompatSseStream::new(Box::pin(captured_upstream));
             Body::from_stream(ResponsesSseLogStream::new(
-                Box::pin(captured_upstream),
+                Box::pin(compat_stream),
                 log_context,
             ))
         } else {
-            Body::from_stream(byte_stream)
+            Body::from_stream(ResponsesCompatSseStream::new(Box::pin(byte_stream)))
         };
         let mut response = Response::new(body);
         *response.status_mut() = StatusCode::OK;
@@ -144,8 +153,8 @@ pub async fn passthrough(
     let body_bytes = upstream_resp.bytes().await.map_err(|e| {
         GatewayError::upstream(StatusCode::BAD_GATEWAY, format!("read upstream body: {e}"))
     })?;
+    let (body_bytes, response_json) = normalize_json_body(body_bytes);
     if let Some(log_context) = &log_context {
-        let response_json = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
         let (status, usage, response_text) = response_json
             .as_ref()
             .map(|value| {
@@ -160,7 +169,10 @@ pub async fn passthrough(
             status: Some(status),
             usage: Some(usage),
             latency_ms: Some(request_log::elapsed_ms(log_context.started_at)),
-            response_json: response_text,
+            response_json: log_context
+                .details_enabled
+                .then_some(response_text)
+                .flatten(),
             ..RequestLogUpdate::default()
         };
         if let Err(err) = log_context.store.update_record(log_context.log_id, &update) {
@@ -175,4 +187,152 @@ pub async fn passthrough(
         HeaderValue::from_static("application/json"),
     );
     Ok(response)
+}
+
+fn normalize_grok_reasoning_replay(raw_body: &mut serde_json::Value, provider: &ProviderConfig) {
+    if provider.provider_type != ProviderType::GrokResponses {
+        return;
+    }
+
+    let Some(input) = raw_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|item_type| item_type != "reasoning")
+        {
+            continue;
+        }
+
+        if item.get("content").is_some_and(serde_json::Value::is_null) {
+            item.remove("content");
+        }
+
+        let has_encrypted_content = item
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !has_encrypted_content {
+            continue;
+        }
+
+        let has_item_id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_item_id {
+            item.entry("status".to_string())
+                .or_insert_with(|| json!("completed"));
+        } else {
+            item.remove("encrypted_content");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::ai_gateway::config::{ProviderConfig, ProviderType};
+
+    use super::normalize_grok_reasoning_replay;
+
+    fn grok_provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "grok".to_string(),
+            provider_type: ProviderType::GrokResponses,
+            base_url: "https://api.x.ai/v1".to_string(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    fn openai_responses_provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "openai-compatible".to_string(),
+            provider_type: ProviderType::OpenAiResponses,
+            base_url: "https://api.x.ai/v1".to_string(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    #[test]
+    fn xai_reasoning_replay_without_item_id_drops_encrypted_content() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": null,
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque-blob"
+                }
+            ]
+        });
+
+        normalize_grok_reasoning_replay(&mut body, &grok_provider());
+
+        let reasoning = &body["input"][0];
+        assert!(reasoning.get("encrypted_content").is_none());
+        assert!(reasoning.get("content").is_none());
+        assert!(reasoning.get("status").is_none());
+        assert_eq!(reasoning["summary"][0]["text"], "thinking");
+    }
+
+    #[test]
+    fn xai_reasoning_replay_with_item_id_keeps_blob_and_adds_status() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "content": null,
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque-blob"
+                }
+            ]
+        });
+
+        normalize_grok_reasoning_replay(&mut body, &grok_provider());
+
+        let reasoning = &body["input"][0];
+        assert_eq!(reasoning["encrypted_content"], "opaque-blob");
+        assert_eq!(reasoning["status"], "completed");
+        assert!(reasoning.get("content").is_none());
+    }
+
+    #[test]
+    fn openai_responses_provider_does_not_apply_grok_reasoning_replay_compatibility() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": null,
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque-blob"
+                }
+            ]
+        });
+
+        normalize_grok_reasoning_replay(&mut body, &openai_responses_provider());
+
+        let reasoning = &body["input"][0];
+        assert_eq!(reasoning["encrypted_content"], "opaque-blob");
+        assert!(
+            reasoning
+                .get("content")
+                .is_some_and(|value| value.is_null())
+        );
+        assert!(reasoning.get("status").is_none());
+    }
 }
