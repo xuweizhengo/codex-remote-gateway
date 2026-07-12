@@ -282,7 +282,7 @@ fn fetch_github_latest_release(
 fn fetch_update_text(text: GuiText, client: &Client, url: &str) -> Result<String, String> {
     let response = client
         .get(url)
-        .header("User-Agent", "codex-remote-gateway")
+        .header("User-Agent", "codexhub")
         .header("Accept", "application/json")
         .send()
         .map_err(|err| {
@@ -702,33 +702,33 @@ fn update_download_path(url: &str, asset_type: Option<&str>) -> Result<PathBuf, 
         })
         .collect::<String>();
     Ok(std::env::temp_dir()
-        .join("CodexRemoteGatewayUpdates")
+        .join("CodexHubUpdates")
         .join(safe_filename))
 }
 
 fn default_update_filename(asset_type: Option<&str>) -> &'static str {
     match asset_type.unwrap_or_default().to_ascii_lowercase().as_str() {
-        "msi" => "CodexRemoteGateway-update.msi",
-        "dmg" => "CodexRemoteGateway-update.dmg",
-        "app-zip" => "CodexRemoteGateway-update.app.zip",
-        "zip" => "CodexRemoteGateway-update.zip",
+        "msi" => "CodexHub-update.msi",
+        "dmg" => "CodexHub-update.dmg",
+        "app-zip" => "CodexHub-update.app.zip",
+        "zip" => "CodexHub-update.zip",
         _ => default_platform_update_filename(),
     }
 }
 
 #[cfg(target_os = "windows")]
 fn default_platform_update_filename() -> &'static str {
-    "CodexRemoteGateway-update.msi"
+    "CodexHub-update.msi"
 }
 
 #[cfg(target_os = "macos")]
 fn default_platform_update_filename() -> &'static str {
-    "CodexRemoteGateway-update.dmg"
+    "CodexHub-update.dmg"
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn default_platform_update_filename() -> &'static str {
-    "CodexRemoteGateway-update"
+    "CodexHub-update"
 }
 
 fn launch_downloaded_update(

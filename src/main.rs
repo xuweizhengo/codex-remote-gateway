@@ -605,11 +605,7 @@ fn init_logging(config: &AppConfig) -> anyhow::Result<PathBuf> {
     )?;
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("codex_remote_gateway=info".parse()?)
-                .add_directive("codexhub=info".parse()?),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("codexhub=info".parse()?))
         .with_ansi(false)
         .init();
     Ok(path)

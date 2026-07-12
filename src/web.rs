@@ -299,7 +299,7 @@ async fn logging_status(State(state): State<SharedState>) -> Json<LoggingStatusR
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("logs")
-            .join("codex-remote-gateway-chain.log")
+            .join("codexhub-chain.log")
     });
     let log_dir = active_log_path
         .parent()

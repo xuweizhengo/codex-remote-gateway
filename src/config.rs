@@ -121,7 +121,7 @@ impl Default for AppConfig {
             language: None,
             theme: None,
             codex_app_fast_startup: false,
-            state_path: PathBuf::from("codex-remote-gateway-state.json"),
+            state_path: PathBuf::from("codexhub-state.json"),
             logging: LoggingConfig::default(),
             feishu: FeishuConfig::default(),
             telegram: TelegramConfig::default(),

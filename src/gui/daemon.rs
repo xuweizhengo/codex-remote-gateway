@@ -689,7 +689,7 @@ fn daemon_startup_log_path_for_config_path(config_path: &Path) -> PathBuf {
 pub(super) fn platform_app_support_config_path() -> PathBuf {
     let legacy = env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support/Codex Remote Gateway/config.toml"));
+        .map(|home| home.join("Library/Application Support/CodexHub/config.toml"));
     if let Some(path) = legacy.filter(|path| path.exists()) {
         return path;
     }
@@ -698,30 +698,14 @@ pub(super) fn platform_app_support_config_path() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let preferred = base.join("Codex Remote Gateway").join("config.toml");
-    if preferred.exists() {
-        return preferred;
-    }
-    let legacy = base.join("CodexHub").join("config.toml");
-    if legacy.exists() {
-        return legacy;
-    }
-    preferred
+    base.join("CodexHub").join("config.toml")
 }
 
 #[cfg(not(target_os = "windows"))]
 pub(super) fn platform_app_support_config_path() -> PathBuf {
     let base = env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| {
-            let preferred = home.join("Library/Application Support/Codex Remote Gateway");
-            if preferred.exists() {
-                preferred
-            } else {
-                let legacy = home.join("Library/Application Support/CodexHub");
-                if legacy.exists() { legacy } else { preferred }
-            }
-        })
+        .map(|home| home.join("Library/Application Support/CodexHub"))
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("config.toml")
@@ -746,7 +730,7 @@ pub(super) fn adjacent_config_from_current_exe() -> Option<PathBuf> {
         .filter(|path| {
             // Only use the exe-adjacent config when its directory is writable.
             // Installed builds under protected locations such as
-            // `C:\\Program Files\\Codex Remote Gateway` ship a default `config.toml` next to
+            // `C:\\Program Files\\CodexHub` ship a default `config.toml` next to
             // the exe, but the directory is read-only for normal-privilege
             // processes, so saving config there fails with HTTP 500. In that
             // case fall through to the per-user app-support path instead.
@@ -763,7 +747,7 @@ fn config_directory_is_writable(dir: &Path) -> bool {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or(0);
-    let probe = dir.join(format!(".codex-remote-gateway-write-probe-{nanos}"));
+    let probe = dir.join(format!(".codexhub-write-probe-{nanos}"));
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);

@@ -36,7 +36,7 @@ pub(super) fn install(
     let taskbar = TaskBarIcon::builder()
         .with_icon_type(icon_type)
         .with_icon(app_icon_bitmap(32))
-        .with_tooltip("Codex Remote Gateway")
+        .with_tooltip("CodexHub")
         .build();
 
     let menu = Rc::new(RefCell::new(

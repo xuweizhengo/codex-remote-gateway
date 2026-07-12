@@ -54,8 +54,7 @@ const LEGACY_UPDATE_MANIFEST_URL: &str =
     "https://github.com/xuweizhengo/codexhub/releases/latest/download/latest.json";
 const UPDATE_RELEASE_API_URL: &str =
     "https://api.github.com/repos/xuweizhengo/codexhub/releases/latest";
-const UPDATE_RELEASE_PAGE_URL: &str =
-    "https://github.com/xuweizhengo/codexhub/releases/latest";
+const UPDATE_RELEASE_PAGE_URL: &str = "https://github.com/xuweizhengo/codexhub/releases/latest";
 const DASHBOARD_REFRESH_INTERVAL_MS: i32 = 10_000;
 const REQUEST_LOG_REFRESH_INTERVAL_MS: i32 = 5_000;
 const REQUEST_LOG_TAB_INDEX: i32 = 3;
@@ -217,7 +216,7 @@ struct GuiSingleInstanceGuard {
 #[cfg(target_os = "windows")]
 impl GuiSingleInstanceGuard {
     fn acquire() -> Option<Self> {
-        let name: Vec<u16> = "Local\\CodexRemoteGatewayGuiSingleInstance"
+        let name: Vec<u16> = "Local\\CodexHubGuiSingleInstance"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -254,8 +253,7 @@ struct GuiSingleInstanceGuard {
 #[cfg(not(target_os = "windows"))]
 impl GuiSingleInstanceGuard {
     fn acquire() -> Option<Self> {
-        SingleInstanceChecker::new("com.xuweizhengo.codex-remote-gateway.gui", None)
-            .map(|checker| Self { checker })
+        SingleInstanceChecker::new("com.codexhub.gui", None).map(|checker| Self { checker })
     }
 
     fn is_another_running(&self) -> bool {
@@ -265,7 +263,7 @@ impl GuiSingleInstanceGuard {
 
 pub fn run() {
     let Some(single_instance_guard) = GuiSingleInstanceGuard::acquire() else {
-        eprintln!("failed to create Codex Remote Gateway GUI single instance checker");
+        eprintln!("failed to create CodexHub GUI single instance checker");
         return;
     };
     if single_instance_guard.is_another_running() {
@@ -273,7 +271,7 @@ pub fn run() {
     }
 
     if let Err(err) = wxdragon::main(|app| build_ui(app, single_instance_guard)) {
-        eprintln!("failed to start Codex Remote Gateway GUI: {err:?}");
+        eprintln!("failed to start CodexHub GUI: {err:?}");
     }
 }
 
@@ -301,7 +299,7 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
     // forces scrolling to find them).
     let frame_size = initial_frame_size();
     let frame = Frame::builder()
-        .with_title("Codex Remote Gateway")
+        .with_title("CodexHub")
         // Keep the first launch within smaller laptop work areas. The tab pages
         // own their scrolling, so the frame itself should not exceed the screen.
         .with_size(frame_size)
@@ -2179,7 +2177,7 @@ fn install_system_menu(
             text.export_connection_diagnostics_help(),
         )
         .append_separator()
-        .append_item(ID_ABOUT, text.about(), "About Codex Remote Gateway")
+        .append_item(ID_ABOUT, text.about(), "About CodexHub")
         .build();
     let menu_bar = MenuBar::builder()
         .append(file_menu, text.file_menu())
@@ -5116,7 +5114,7 @@ enum EndpointStatusState {
 }
 
 fn show_about_dialog(parent: &Frame) {
-    let dialog = Dialog::builder(parent, "About Codex Remote Gateway")
+    let dialog = Dialog::builder(parent, "About CodexHub")
         .with_style(DialogStyle::DefaultDialogStyle)
         .with_size(520, 260)
         .build();
@@ -5128,10 +5126,7 @@ fn show_about_dialog(parent: &Frame) {
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
 
     let title = StaticText::builder(&panel)
-        .with_label(&format!(
-            "Codex Remote Gateway {}",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .with_label(&format!("CodexHub {}", env!("CARGO_PKG_VERSION")))
         .build();
     title.set_foreground_color(theme::theme().ink_primary);
     title.set_font(&theme::font(theme::TextRole::Title));
@@ -5189,14 +5184,14 @@ fn show_about_dialog(parent: &Frame) {
 }
 
 fn show_info(parent: &dyn WxWidget, message: &str) {
-    MessageDialog::builder(parent, message, "Codex Remote Gateway")
+    MessageDialog::builder(parent, message, "CodexHub")
         .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
         .build()
         .show_modal();
 }
 
 fn show_error(parent: &dyn WxWidget, message: &str) {
-    MessageDialog::builder(parent, message, "Codex Remote Gateway")
+    MessageDialog::builder(parent, message, "CodexHub")
         .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
         .build()
         .show_modal();
