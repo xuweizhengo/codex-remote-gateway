@@ -887,6 +887,11 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
     let request_log_clear_all_button = Button::builder(&request_logs_page)
         .with_label(text.request_log_clear_all())
         .build();
+    let request_log_cleanup_status = StaticText::builder(&request_logs_page)
+        .with_label("")
+        .build();
+    request_log_cleanup_status.set_min_size(Size::new(220, 24));
+    request_log_cleanup_status.set_foreground_color(theme::theme().error);
     let request_log_toolbar = BoxSizer::builder(Orientation::Horizontal).build();
     request_log_toolbar.add(&request_log_hint, 0, SizerFlag::AlignCenterVertical, 0);
     request_log_toolbar.add(
@@ -896,6 +901,12 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         0,
     );
     request_log_toolbar.add_stretch_spacer(1);
+    request_log_toolbar.add(
+        &request_log_cleanup_status,
+        0,
+        SizerFlag::Right | SizerFlag::AlignCenterVertical,
+        18,
+    );
     request_log_toolbar.add(
         &ai_gw_enable_logging,
         0,
@@ -1458,17 +1469,37 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
     let request_log_clear_in_flight = Arc::new(AtomicBool::new(false));
     let request_logs_active = Rc::new(Cell::new(notebook.selection() == REQUEST_LOG_TAB_INDEX));
     let request_log_timer_store: FrameTimerStore = Rc::new(RefCell::new(None));
+    let request_log_cleanup_animation_frame = Rc::new(Cell::new(0_usize));
+    let request_log_cleanup_timer_store: FrameTimerStore = Rc::new(RefCell::new(None));
+    let request_log_cleanup_timer = Timer::new(&frame);
+    {
+        let animation_frame = request_log_cleanup_animation_frame.clone();
+        request_log_cleanup_timer.on_tick(move |_| {
+            let frame = (animation_frame.get() + 1) % 3;
+            animation_frame.set(frame);
+            request_log_cleanup_status.set_label(text.request_log_clearing(frame));
+        });
+    }
+    request_log_cleanup_timer.start(450, false);
+    request_log_cleanup_timer.stop();
+    request_log_cleanup_timer_store
+        .borrow_mut()
+        .replace(request_log_cleanup_timer);
+    gui_timers.track(&request_log_cleanup_timer_store);
     {
         let api = api.clone();
         let request_log_result = request_log_result.clone();
         let request_log_in_flight = request_log_in_flight.clone();
+        let request_log_clear_in_flight = request_log_clear_in_flight.clone();
         let request_logs_active = request_logs_active.clone();
         let request_log_timer_store = request_log_timer_store.clone();
         notebook.on_page_changed(move |event| {
             let active = event.get_selection().unwrap_or(-1) == REQUEST_LOG_TAB_INDEX;
             request_logs_active.set(active);
             if active {
-                force_request_log_refresh(&api, &request_log_result, &request_log_in_flight);
+                if !request_log_clear_in_flight.load(Ordering::SeqCst) {
+                    force_request_log_refresh(&api, &request_log_result, &request_log_in_flight);
+                }
                 start_request_log_timer(&request_log_timer_store);
             } else {
                 stop_request_log_timer(&request_log_timer_store);
@@ -1499,6 +1530,8 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let text = handles.text;
         let request_log_clear_result = request_log_clear_result.clone();
         let request_log_clear_in_flight = request_log_clear_in_flight.clone();
+        let request_log_cleanup_animation_frame = request_log_cleanup_animation_frame.clone();
+        let request_log_cleanup_timer_store = request_log_cleanup_timer_store.clone();
         request_log_clear_old_button.on_click(move |_| {
             if request_log_clear_in_flight.swap(true, Ordering::SeqCst) {
                 return;
@@ -1509,6 +1542,10 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
             }
             request_log_clear_old_button.enable(false);
             request_log_clear_all_button.enable(false);
+            request_log_cleanup_animation_frame.set(0);
+            request_log_cleanup_status.set_label(text.request_log_clearing(0));
+            request_log_cleanup_status.set_foreground_color(theme::theme().error);
+            start_request_log_cleanup_animation(&request_log_cleanup_timer_store);
             let thread_api = api.clone();
             let request_log_clear_result = request_log_clear_result.clone();
             let request_log_clear_in_flight = request_log_clear_in_flight.clone();
@@ -1530,6 +1567,8 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let text = handles.text;
         let request_log_clear_result = request_log_clear_result.clone();
         let request_log_clear_in_flight = request_log_clear_in_flight.clone();
+        let request_log_cleanup_animation_frame = request_log_cleanup_animation_frame.clone();
+        let request_log_cleanup_timer_store = request_log_cleanup_timer_store.clone();
         request_log_clear_all_button.on_click(move |_| {
             if request_log_clear_in_flight.swap(true, Ordering::SeqCst) {
                 return;
@@ -1540,6 +1579,10 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
             }
             request_log_clear_old_button.enable(false);
             request_log_clear_all_button.enable(false);
+            request_log_cleanup_animation_frame.set(0);
+            request_log_cleanup_status.set_label(text.request_log_clearing(0));
+            request_log_cleanup_status.set_foreground_color(theme::theme().error);
+            start_request_log_cleanup_animation(&request_log_cleanup_timer_store);
             let thread_api = api.clone();
             let request_log_clear_result = request_log_clear_result.clone();
             let request_log_clear_in_flight = request_log_clear_in_flight.clone();
@@ -1567,6 +1610,8 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let request_log_in_flight = request_log_in_flight.clone();
         let request_log_detail_result = request_log_detail_result.clone();
         let request_log_clear_result = request_log_clear_result.clone();
+        let request_log_clear_in_flight = request_log_clear_in_flight.clone();
+        let request_log_cleanup_timer_store = request_log_cleanup_timer_store.clone();
         let request_logs_active = request_logs_active.clone();
         request_log_timer.on_tick(move |_| {
             apply_pending_request_logs(&handles, &request_log_result);
@@ -1576,12 +1621,14 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
                 handles.text,
                 &request_log_clear_old_button,
                 &request_log_clear_all_button,
+                &request_log_cleanup_status,
+                &request_log_cleanup_timer_store,
                 &request_log_clear_result,
             ) && request_logs_active.get()
             {
                 force_request_log_refresh(&api, &request_log_result, &request_log_in_flight);
             }
-            if request_logs_active.get() {
+            if request_logs_active.get() && !request_log_clear_in_flight.load(Ordering::SeqCst) {
                 schedule_request_log_refresh(&api, &request_log_result, &request_log_in_flight);
             }
         });
@@ -1628,6 +1675,7 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
         let request_log_detail_result = request_log_detail_result.clone();
         let request_log_in_flight = request_log_in_flight.clone();
         let request_log_clear_result = request_log_clear_result.clone();
+        let request_log_cleanup_timer_store = request_log_cleanup_timer_store.clone();
         let diagnostics_export_result = diagnostics_export_result.clone();
         let request_logs_active = request_logs_active.clone();
         let request_log_clear_old_button = request_log_clear_old_button;
@@ -1663,6 +1711,8 @@ fn build_ui(app: App, single_instance_guard: GuiSingleInstanceGuard) {
                 handles.text,
                 &request_log_clear_old_button,
                 &request_log_clear_all_button,
+                &request_log_cleanup_status,
+                &request_log_cleanup_timer_store,
                 &request_log_clear_result,
             ) && request_logs_active.get()
             {
@@ -3863,7 +3913,7 @@ mod model_mapping_tests {
     }
 
     #[test]
-    fn endpoint_status_keeps_codex_app_vscode_and_cli_independent() {
+    fn endpoint_status_requires_initialized_source_connection() {
         let remote = RemoteControlStatus {
             connected: true,
             initialized: true,
@@ -3884,7 +3934,7 @@ mod model_mapping_tests {
 
         assert_eq!(
             endpoint_status_state(Some(&remote), "codex_app", true),
-            EndpointStatusState::Connected
+            EndpointStatusState::NotConnected
         );
         assert_eq!(
             endpoint_status_state(Some(&remote), "vscode", true),
@@ -3897,7 +3947,7 @@ mod model_mapping_tests {
     }
 
     #[test]
-    fn endpoint_status_uninitialized_source_is_connected_when_channel_is_open() {
+    fn endpoint_status_uninitialized_source_is_not_connected_when_channel_is_open() {
         let remote = RemoteControlStatus {
             connected: true,
             initialized: false,
@@ -3911,7 +3961,7 @@ mod model_mapping_tests {
 
         assert_eq!(
             endpoint_status_state(Some(&remote), "vscode", true),
-            EndpointStatusState::Connected
+            EndpointStatusState::NotConnected
         );
         assert_eq!(
             endpoint_status_state(Some(&remote), "cli", true),
@@ -3920,7 +3970,7 @@ mod model_mapping_tests {
     }
 
     #[test]
-    fn endpoint_status_connected_takes_priority_over_config_state() {
+    fn endpoint_status_does_not_use_legacy_active_source_without_connection() {
         let remote = RemoteControlStatus {
             connected: true,
             initialized: true,
@@ -3930,7 +3980,7 @@ mod model_mapping_tests {
 
         assert_eq!(
             endpoint_status_state(Some(&remote), "codex_app", false),
-            EndpointStatusState::Connected
+            EndpointStatusState::UninitializedConfig
         );
     }
 
@@ -3957,7 +4007,7 @@ mod model_mapping_tests {
     }
 
     #[test]
-    fn codex_app_status_is_connected_for_open_uninitialized_channel() {
+    fn codex_app_status_is_not_connected_for_open_uninitialized_channel() {
         let remote = RemoteControlStatus {
             connected: true,
             initialized: false,
@@ -3971,7 +4021,7 @@ mod model_mapping_tests {
 
         assert_eq!(
             endpoint_status_state(Some(&remote), "codex_app", true),
-            EndpointStatusState::Connected
+            EndpointStatusState::NotConnected
         );
     }
 
@@ -4842,9 +4892,6 @@ fn update_dashboard(handles: &UiHandles, snapshot: &DashboardSnapshot, daemon_st
         codex_tab::refresh_configured(&handles.codex_tab, false);
     }
     codex_tab::refresh_local_connection_mode(&handles.codex_tab, snapshot.local_connection_mode);
-    if let Some(status) = &snapshot.status {
-        codex_tab::refresh_fast_startup(&handles.codex_tab, status.codex_app_fast_startup);
-    }
     if let Some(gw) = &snapshot.ai_gateway {
         refresh_ai_gw_filter_image_generation(handles, gw.filter_image_generation_tool);
         refresh_ai_gw_enable_logging(
@@ -4940,6 +4987,24 @@ fn start_request_log_timer(timer_store: &FrameTimerStore) {
 }
 
 fn stop_request_log_timer(timer_store: &FrameTimerStore) {
+    let store = timer_store.borrow();
+    if let Some(timer) = store.as_ref()
+        && timer.is_running()
+    {
+        timer.stop();
+    }
+}
+
+fn start_request_log_cleanup_animation(timer_store: &FrameTimerStore) {
+    let store = timer_store.borrow();
+    if let Some(timer) = store.as_ref()
+        && !timer.is_running()
+    {
+        timer.start(450, false);
+    }
+}
+
+fn stop_request_log_cleanup_animation(timer_store: &FrameTimerStore) {
     let store = timer_store.borrow();
     if let Some(timer) = store.as_ref()
         && timer.is_running()
@@ -5050,20 +5115,28 @@ fn apply_pending_request_log_clear(
     text: GuiText,
     clear_old_button: &Button,
     clear_all_button: &Button,
+    status: &StaticText,
+    animation_timer_store: &FrameTimerStore,
     result_store: &RequestLogClearResultStore,
 ) -> bool {
     let result = result_store.lock().ok().and_then(|mut slot| slot.take());
     let Some(result) = result else {
         return false;
     };
+    stop_request_log_cleanup_animation(animation_timer_store);
     clear_old_button.enable(true);
     clear_all_button.enable(true);
     match result {
         Ok(deleted) => {
-            show_info(frame, &text.request_log_clear_done(deleted));
+            let message = text.request_log_clear_done(deleted);
+            status.set_label(text.request_log_clear_done_status());
+            status.set_foreground_color(theme::theme().ok);
+            show_info(frame, &message);
             true
         }
         Err(err) => {
+            status.set_label(text.request_log_clear_failed_status());
+            status.set_foreground_color(theme::theme().error);
             show_error(frame, &text.request_log_clear_failed(&err));
             false
         }
@@ -5088,19 +5161,13 @@ fn apply_pending_diagnostics_export(
 fn remote_source_connected(remote: Option<&RemoteControlStatus>, source_kind: &str) -> bool {
     remote
         .map(|remote| {
-            remote
-                .connections
-                .iter()
-                .any(|connection| connection.source_kind == source_kind && connection.connected)
+            remote.connections.iter().any(|connection| {
+                connection.source_kind == source_kind
+                    && connection.connected
+                    && connection.initialized
+            })
         })
         .unwrap_or(false)
-}
-
-fn remote_active_connected(remote: Option<&RemoteControlStatus>, source_kind: &str) -> bool {
-    remote
-        .filter(|remote| remote.connected)
-        .and_then(|remote| remote.active_source_kind.as_deref())
-        == Some(source_kind)
 }
 
 fn endpoint_status_state(
@@ -5110,9 +5177,7 @@ fn endpoint_status_state(
 ) -> EndpointStatusState {
     if remote.is_none() {
         EndpointStatusState::Loading
-    } else if remote_source_connected(remote, source_kind)
-        || remote_active_connected(remote, source_kind)
-    {
+    } else if remote_source_connected(remote, source_kind) {
         EndpointStatusState::Connected
     } else if !configured {
         EndpointStatusState::UninitializedConfig
