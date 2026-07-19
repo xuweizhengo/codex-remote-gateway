@@ -1,7 +1,9 @@
-﻿use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{Json, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode};
 use serde_json::{Map, Value, json};
+
+use crate::{ai_gateway::catalog::configured_models_response_with_etag, app_state::SharedState};
 
 pub(super) async fn accounts_check() -> Json<Value> {
     Json(json!({
@@ -25,34 +27,37 @@ pub(super) async fn accounts_check() -> Json<Value> {
     }))
 }
 
-pub(super) async fn statsig_bootstrap() -> Json<Value> {
+pub(super) async fn statsig_bootstrap(State(state): State<SharedState>) -> Json<Value> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
-    let payload = statsig_bootstrap_payload(now_ms);
+    let model_slugs = {
+        let config = state.config.lock().await;
+        let (models, _) = configured_models_response_with_etag(&config.ai_gateway);
+        models["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let payload = statsig_bootstrap_payload(now_ms, &model_slugs);
     Json(json!({
         "statsigPayload": payload.to_string(),
     }))
 }
 
-fn statsig_bootstrap_payload(now_ms: u64) -> Value {
+fn statsig_bootstrap_payload(now_ms: u64, model_slugs: &[String]) -> Value {
     let mut feature_gates = Map::new();
     for gate in [
-        "1834314516",
-        "1714131075",
-        "72045066",
-        "2982604767",
-        "2177625257",
-        "3657624089",
-        "3245360288",
-        "3646210497",
-        "1186680773",
         "1042620455",
         "4114442250",
         "824038554",
         "410065390",
         "2296472986",
+        "3446105535",
     ] {
         feature_gates.insert(
             gate.to_string(),
@@ -65,12 +70,18 @@ fn statsig_bootstrap_payload(now_ms: u64) -> Value {
         );
     }
 
+    let model_list_config = json!({
+        "available_models": model_slugs,
+        "use_hidden_models": false,
+        "default_model": model_slugs.first().map(String::as_str).unwrap_or("gpt-5.5"),
+    });
+
     json!({
         "response_format": "init-v2",
         "feature_gates": feature_gates,
         "dynamic_configs": {
             "107580212": {
-                "v": "codexhub_model_list_config",
+                "v": model_list_config.clone(),
                 "r": "codexhub-local",
                 "s": [],
                 "i": "userID",
@@ -98,7 +109,7 @@ fn statsig_bootstrap_payload(now_ms: u64) -> Value {
         },
         "param_stores": {},
         "values": {
-            "codexhub_model_list_config": {},
+            "codexhub_model_list_config": model_list_config,
             "codexhub_primary_runtime_config": {},
             "codexhub_i18n_layer_config": {
                 "enable_i18n": true,
@@ -204,24 +215,44 @@ mod tests {
 
     #[test]
     fn statsig_bootstrap_payload_matches_codex_app_sync_bootstrap_shape() {
-        let response = statsig_bootstrap_payload(1234);
+        let response = statsig_bootstrap_payload(
+            1234,
+            &[
+                "gpt-5.6-sol".to_string(),
+                "grok-4.5".to_string(),
+                "Opus-4.8".to_string(),
+            ],
+        );
 
         assert_eq!(response["has_updates"], true);
         assert_eq!(response["response_format"], "init-v2");
         assert_eq!(response["time"], 1234);
         assert_eq!(response["user"]["userID"], "user_codexhub_local");
         let gates = response["feature_gates"].as_object().unwrap();
-        assert!(gates["1834314516"].is_object());
+        assert_eq!(gates.len(), 6);
         for gate in [
             "1042620455",
             "4114442250",
             "824038554",
             "410065390",
             "2296472986",
+            "3446105535",
         ] {
             assert_eq!(gates[gate]["v"], true);
         }
-        for gate in ["2055603567", "3936985709"] {
+        for gate in [
+            "1834314516",
+            "1714131075",
+            "72045066",
+            "2982604767",
+            "2177625257",
+            "3657624089",
+            "3245360288",
+            "3646210497",
+            "1186680773",
+            "2055603567",
+            "3936985709",
+        ] {
             assert_ne!(
                 gates
                     .get(gate)
@@ -231,6 +262,18 @@ mod tests {
             );
         }
         assert!(response["dynamic_configs"]["107580212"].is_object());
+        assert_eq!(
+            response["dynamic_configs"]["107580212"]["v"]["available_models"],
+            json!(["gpt-5.6-sol", "grok-4.5", "Opus-4.8"])
+        );
+        assert_eq!(
+            response["dynamic_configs"]["107580212"]["v"]["default_model"],
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            response["values"]["codexhub_model_list_config"],
+            response["dynamic_configs"]["107580212"]["v"]
+        );
         assert!(response["layer_configs"]["2096615506"].is_object());
         assert!(response["layer_configs"]["72216192"].is_object());
         assert_eq!(

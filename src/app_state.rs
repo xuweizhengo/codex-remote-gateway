@@ -5,7 +5,7 @@
 };
 
 use tokio::{
-    sync::{Mutex, broadcast, oneshot, watch},
+    sync::{Mutex, broadcast, oneshot},
     task::JoinHandle,
 };
 
@@ -45,7 +45,6 @@ pub struct AppState {
     pub wechat_onboard: Mutex<Option<WechatOnboardSession>>,
     pub wecom_onboard: Mutex<Option<WecomOnboardSession>>,
     pub shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    pub codex_app_fast_startup_tx: watch::Sender<bool>,
 }
 
 pub struct RemoteControlState {
@@ -344,7 +343,6 @@ impl AppState {
         let request_log_db_path = crate::ai_gateway::request_log::database_path(&config);
         crate::ai_gateway::request_log::migrate_legacy_database(&config, &request_log_db_path);
         let ai_gateway_request_logs = RequestLogStore::new(request_log_db_path);
-        let (codex_app_fast_startup_tx, _) = watch::channel(config.codex_app_fast_startup);
         Arc::new(Self {
             config_path,
             daemon_identity: daemon_identity.unwrap_or_else(DaemonIdentity::new),
@@ -364,7 +362,6 @@ impl AppState {
             wechat_onboard: Mutex::new(None),
             wecom_onboard: Mutex::new(None),
             shutdown_tx: Mutex::new(shutdown_tx),
-            codex_app_fast_startup_tx,
         })
     }
 
