@@ -12,6 +12,8 @@ use super::text::GuiText;
 use super::{GUI_ACTION_TIMEOUT, GUI_CONFIG_TIMEOUT, GUI_CONNECT_TIMEOUT, GUI_STATUS_TIMEOUT};
 
 const GUI_SESSION_HISTORY_TIMEOUT: Duration = Duration::from_secs(30);
+const GUI_CODEX_ENHANCED_LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
+const GUI_REQUEST_LOG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const GUI_WECHAT_ONBOARD_POLL_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
@@ -237,15 +239,24 @@ impl ApiClient {
         self.post_empty_with_timeout("/api/codex-app/repair-gui-environment", GUI_CONFIG_TIMEOUT)
     }
 
-    pub(super) fn set_codex_app_fast_startup(
-        &self,
-        request: &SetCodexAppFastStartupRequest,
-    ) -> Result<serde_json::Value, String> {
-        self.post_json_with_timeout("/api/codex-app/fast-startup", request, GUI_CONFIG_TIMEOUT)
-    }
-
     pub(super) fn refresh_codex_app_models(&self) -> Result<serde_json::Value, String> {
         self.post_empty_with_timeout("/api/codex-app/models/refresh", GUI_CONFIG_TIMEOUT)
+    }
+
+    pub(super) fn launch_codex_app_enhanced(&self) -> Result<serde_json::Value, String> {
+        self.post_empty_with_timeout(
+            "/api/codex-app/enhanced-launch",
+            GUI_CODEX_ENHANCED_LAUNCH_TIMEOUT,
+        )
+    }
+
+    pub(super) fn codex_app_enhanced_preflight(
+        &self,
+    ) -> Result<CodexAppEnhancedPreflightResponse, String> {
+        self.get_with_timeout(
+            "/api/codex-app/enhanced-launch/preflight",
+            GUI_STATUS_TIMEOUT,
+        )
     }
 
     pub(super) fn set_im_account_enabled(
@@ -331,13 +342,16 @@ impl ApiClient {
     pub(super) fn ai_gateway_clear_old_request_logs(
         &self,
     ) -> Result<ClearRequestLogsResponse, String> {
-        self.delete_with_timeout("/ai-gateway/request-logs/old?days=3", GUI_CONFIG_TIMEOUT)
+        self.delete_with_timeout(
+            "/ai-gateway/request-logs/old?days=3",
+            GUI_REQUEST_LOG_CLEANUP_TIMEOUT,
+        )
     }
 
     pub(super) fn ai_gateway_clear_all_request_logs(
         &self,
     ) -> Result<ClearRequestLogsResponse, String> {
-        self.delete_with_timeout("/ai-gateway/request-logs", GUI_CONFIG_TIMEOUT)
+        self.delete_with_timeout("/ai-gateway/request-logs", GUI_REQUEST_LOG_CLEANUP_TIMEOUT)
     }
 }
 
@@ -402,8 +416,18 @@ pub(super) struct ServerStatus {
     pub(super) bind: String,
     #[serde(default)]
     pub(super) local_connection_mode: LocalConnectionMode,
-    #[serde(default)]
-    pub(super) codex_app_fast_startup: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CodexAppEnhancedPreflightResponse {
+    pub(super) status: CodexAppEnhancedPreflight,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CodexAppEnhancedPreflight {
+    pub(super) running: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -430,9 +454,11 @@ pub(super) struct ImAccountItem {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct RemoteControlStatus {
+    #[allow(dead_code)]
     pub(super) connected: bool,
     #[allow(dead_code)]
     pub(super) initialized: bool,
+    #[allow(dead_code)]
     pub(super) active_source_kind: Option<String>,
     #[serde(default)]
     pub(super) connections: Vec<RemoteControlConnectionStatus>,
@@ -442,7 +468,6 @@ pub(super) struct RemoteControlStatus {
 #[serde(rename_all = "camelCase")]
 pub(super) struct RemoteControlConnectionStatus {
     pub(super) connected: bool,
-    #[allow(dead_code)]
     pub(super) initialized: bool,
     pub(super) source_kind: String,
 }
@@ -507,12 +532,6 @@ pub(super) struct MoveCodexAppSessionProviderRequest {
     pub(super) target_provider: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct SetCodexAppFastStartupRequest {
-    pub(super) enabled: bool,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -527,7 +546,6 @@ mod tests {
             ServerStatus {
                 bind: "127.0.0.1:3847".to_string(),
                 local_connection_mode: LocalConnectionMode::Standard,
-                codex_app_fast_startup: true,
             },
             None,
             None,
@@ -567,7 +585,6 @@ mod tests {
             ServerStatus {
                 bind: "127.0.0.1:3847".to_string(),
                 local_connection_mode: LocalConnectionMode::Standard,
-                codex_app_fast_startup: true,
             },
             Some(remote),
             Some(codex_app),
@@ -652,7 +669,6 @@ pub(super) struct ConfigureRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) image_generation_enabled: Option<bool>,
     pub(super) supports_websockets: bool,
-    pub(super) fast_startup: bool,
 }
 
 #[derive(Serialize)]

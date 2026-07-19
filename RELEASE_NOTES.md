@@ -1,34 +1,40 @@
-CodexHub v0.3.36
+CodexHub v0.4.4
 
-本版本重点适配 GPT-5.6 Sol、Terra、Luna 的 Responses Lite 工具协议，并完善 Web Search、生图和会话历史拉取。
+这是一次以 Codex App 体验和协议稳定性为核心的更新：增强模式现在可以更快启动 Codex App、同步自定义模型和中文界面，同时补齐 Grok 的 `apply_patch` / `web_search` 工具桥接，并改善超长历史会话与请求日志清理。
 
-## GPT-5.6 Responses Lite
+## Codex App 增强模式
 
-- 识别 `input[].type = additional_tools`、namespace tool 和 `tool_mode = code_mode_only` 下的嵌套工具结构，兼容 GPT-5.6 系列通过 `exec` 调用工具的新方式。
-- 日志分别保留 Codex 原始请求和 Gateway 实际上游请求，便于判断工具是由 Codex、Gateway 还是上游处理。
-- 图片工具过滤同时覆盖旧版 hosted `image_generation`、新版 `image_gen` namespace、`additional_tools` 以及 `exec` 描述中的 `image_gen__imagegen`。
+- 在 Codex 接入页提供“增强模式启动 Codex”，把 CodexHub 可见模型同步到 Codex App 前端；普通启动、Codex CLI 和 VS Code 插件不受影响。
+- 不修改 Codex App 的 ASAR、LevelDB、快捷方式，也不再占用 `localhost:8000`；增强状态仅存在于本次 Codex App 进程。
+- 启动时优先复用完整的官方 Statsig 缓存，只增量覆盖模型列表、中文能力和已确认的关键 gate，保留插件、runtime 与其他官方配置。
+- 修复无 VPN 或官方 Statsig 网络不稳定时，renderer 在启动页等待约 30 至 36 秒的问题；本地初始化会在 React 路由挂载前完成，异常时自动回退官方路径。
+- 修复增强模式下切换中文不生效的问题，并同步处理 Statsig store、i18n layer 与 React memo cache。
+- Windows 改用原生 COM 激活商店版 Codex App，不再启动隐藏 PowerShell，减少 Windows 安全中心误报和启动闪窗。
+- Codex 配置未初始化时禁用增强启动；配置文件内容未变化时不再重复替换，继续保留原子写入、备份和全零文件恢复保护。
 
-## Web Search
+## Grok 工具桥接
 
-- GPT-5.6 Responses Lite 请求使用 OpenAI Responses 渠道时，在顶层注入标准 hosted `web_search`，恢复当前上游已支持的搜索能力。
-- 注入逻辑保持幂等，并保留原有工具；当请求已经包含原生 `web.run` 时不会重复注入 hosted Web Search。
-- 本版本暂不伪装 `/alpha/search` 或原生 `web.run` runtime，避免出现工具可见但执行 404 的半成品状态。
+- 将 Codex 的 custom `apply_patch` 工具转换为 Grok Responses function schema，并在响应时恢复为 Codex 可执行的 `custom_tool_call`。
+- 完整支持 `apply_patch` 的历史回放、工具结果、非流式响应和 SSE 流式事件；实际文件修改仍由 Codex 本地执行。
+- 对 Grok 偶发生成的 Markdown 对称星号控制行做严格、局部修复，不猜测或改写普通补丁内容。
+- 将 `web_search_preview` 规范化为 Grok hosted `web_search`，兼容图片搜索和域名过滤字段；上游搜索事件原样返回 Codex。
+- Grok 兼容逻辑严格限定在 Grok Provider，OpenAI Responses / Responses Lite 原生字段继续透传。
 
-## Image Generation
+## 历史会话与启动稳定性
 
-- 新增 `/ai-gateway/v1/images/generations` 和 `/ai-gateway/v1/images/edits`，支持 Codex 新版 standalone `image_gen` 工具调用独立 Images API。
-- 按 `gpt-image-2` 选择已启用 Provider，并支持通过 `modelAliases` 映射上游图片模型。
-- 复用现有 Provider 的权重、API Key、超时、传输重试和错误映射；未配置图片模型时返回明确的 `invalid_model`，不再本地 404。
-- 图片生成和编辑会进入请求日志，记录渠道、状态、耗时和 usage；图片 base64、URL 与鉴权信息均脱敏，只保留 MIME 和大小摘要。
-- 无模型 alias 时直接转发原始请求字节，避免复制大型图片 data URL。
+- 启用 Codex App 当前版本的按需历史恢复 gate，恢复会话时先读取最近 5 个 turn，更早内容在向上滚动时继续分页加载。
+- 避免超长历史会话在启动时被一次性排空，降低启动卡顿、内存峰值和 renderer 崩溃风险；不会删除或截断历史内容。
+- 增强启动增加模型、中文、gate、renderer 和本地 Statsig 初始化诊断字段，便于 Codex App 更新后快速核对兼容性。
 
-## Session History
+## 请求日志清理
 
-- 会话历史改为直接查询已初始化且健康的 Codex App、CLI 或 VS Code remote-control 连接，优先使用当前活跃和最近有响应的连接。
-- `thread/list` 使用 `useStateDbOnly = true`，只扫描 CLI 和 VS Code 交互会话，避免慢速文件系统全量发现。
-- 支持分页拉取，并在当前连接失败时切换到其他健康连接，提高历史会话列表的打开速度和稳定性。
+- 删除旧日志或全部日志后执行 SQLite `VACUUM`，实际回收数据库占用的磁盘空间。
+- 清理和磁盘回收在后台执行；维护期间新请求日志进入队列，AI Gateway 请求转发不会被数据库维护阻塞。
+- GUI 增加醒目的动态“正在清理...”状态、完成/失败结果，并延长大型数据库清理的等待时间。
+- 清理过程中暂停列表刷新，避免并发查询干扰维护任务。
 
-## Documentation
+## 验证
 
-- 新增 GPT-5.6 Responses Lite Web Search 协议、限制和未来原生 `web.run` 接入说明。
-- 新增 Codex 5.5 与 5.6 生图链路变化、Images API 路由和升级审计文档。
+- 全量测试：`524 passed, 0 failed, 2 ignored`。
+- `cargo check --release --features gui --bin codexhub` 通过。
+- Windows 实机验证增强模式启动提速、自定义模型和中文界面生效。

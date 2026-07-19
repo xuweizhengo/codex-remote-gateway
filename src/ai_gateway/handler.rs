@@ -1,4 +1,5 @@
 use std::{
+    io::{Cursor, Read},
     sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
@@ -6,8 +7,11 @@ use std::{
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderName, HeaderValue, header::ETAG},
+    extract::{Path, Query, RawQuery, State},
+    http::{
+        HeaderMap, HeaderName, HeaderValue,
+        header::{CONTENT_ENCODING, ETAG},
+    },
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, de::IntoDeserializer};
@@ -21,13 +25,134 @@ use super::config::{ProviderConfig, ProviderType};
 use super::context::GatewayContext;
 use super::error::GatewayError;
 use super::model::GatewayRequest;
-use super::providers::{anthropic_messages, deepseek_chat, openai_images, openai_responses};
+use super::providers::{
+    anthropic_messages, deepseek_chat, openai_alpha_search, openai_images, openai_responses,
+};
 use super::request_log::{
     self, RequestLogContext, RequestLogRecord, RequestLogStore, RequestLogUpdate,
 };
-use super::router::resolve_provider_with_state;
+use super::responses_lite_tools::prepare_for_provider;
+use super::router::{resolve_provider_with_state, resolve_provider_with_state_for_type};
 
 static AI_GATEWAY_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+const MAX_DECOMPRESSED_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+/// POST /ai-gateway/v1/alpha/search
+pub async fn handle_alpha_search(
+    State(state): State<SharedState>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started_at = Instant::now();
+    let created_at_ms = request_log::now_ms();
+    let body = match decode_request_body(&headers, body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let config = state.config.lock().await;
+    let gateway_config = config.ai_gateway.clone();
+    let request_logging_enabled = gateway_config.request_logging_enabled;
+    let request_log_details_enabled = gateway_config.request_log_details_enabled;
+    drop(config);
+
+    let inspection = match openai_alpha_search::inspect_request(&body) {
+        Ok(inspection) => inspection,
+        Err(error) => return error.into_response(),
+    };
+    let request_model = inspection.model.clone();
+    let context = GatewayContext::extract(&headers, None);
+    let routing_session_id = context
+        .session_id
+        .as_deref()
+        .or(inspection.session_id.as_deref());
+    let routing_now = Instant::now();
+    let (provider, route_id) = {
+        let mut routing = state.ai_gateway_routing.lock().await;
+        routing.evict_stale(routing_now);
+        match resolve_provider_with_state_for_type(
+            &request_model,
+            routing_session_id,
+            &gateway_config,
+            &mut routing,
+            routing_now,
+            &ProviderType::OpenAiResponses,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(routing);
+                let log_context = request_logging_enabled
+                    .then(|| {
+                        insert_initial_alpha_search_log(
+                            &state.ai_gateway_request_logs,
+                            &context,
+                            &headers,
+                            &request_model,
+                            None,
+                            &inspection.body,
+                            started_at,
+                            created_at_ms,
+                            request_log_details_enabled,
+                        )
+                    })
+                    .flatten();
+                update_failed_log(&log_context, &error.message);
+                return error.into_response();
+            }
+        }
+    };
+    let upstream_model = provider
+        .resolve_upstream_model(&request_model)
+        .unwrap_or(request_model.as_str())
+        .to_string();
+
+    info!(
+        model = %request_model,
+        upstream_model = %upstream_model,
+        provider = %provider.name,
+        "ai-gateway alpha search request routed"
+    );
+
+    let log_context = request_logging_enabled
+        .then(|| {
+            insert_initial_alpha_search_log(
+                &state.ai_gateway_request_logs,
+                &context,
+                &headers,
+                &request_model,
+                Some(provider),
+                &inspection.body,
+                started_at,
+                created_at_ms,
+                request_log_details_enabled,
+            )
+        })
+        .flatten();
+    let client = crate::outbound_http::get();
+    let result = openai_alpha_search::passthrough(
+        &client,
+        &context,
+        inspection.body,
+        &upstream_model,
+        provider,
+        raw_query.as_deref(),
+        log_context.clone(),
+    )
+    .await;
+    let outcome = match &result {
+        Ok(response) => classify_response_status(response.status()),
+        Err(error) if is_circuit_breaker_failure(error.status) => RoutingOutcome::UpstreamFailure,
+        Err(_) => RoutingOutcome::Ignore,
+    };
+    record_routing_outcome(&state, &route_id, outcome).await;
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            update_failed_log(&log_context, &error.message);
+            error.into_response()
+        }
+    }
+}
 
 /// POST /ai-gateway/v1/images/generations
 pub async fn handle_image_generations(
@@ -168,6 +293,139 @@ async fn handle_image_request(
     }
 }
 
+/// POST /ai-gateway/v1/responses/compact
+pub async fn handle_responses_compact(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started_at = Instant::now();
+    let created_at_ms = request_log::now_ms();
+    let config = state.config.lock().await;
+    let gw_config = config.ai_gateway.clone();
+    let request_logging_enabled = gw_config.request_logging_enabled;
+    let request_log_details_enabled = gw_config.request_log_details_enabled;
+    let models_etag = configured_models_etag(&gw_config);
+    drop(config);
+    let in_flight = AI_GATEWAY_IN_FLIGHT.fetch_add(1, Ordering::AcqRel) + 1;
+    let _in_flight_guard = AiGatewayInFlightGuard;
+
+    let body = match decode_request_body(&headers, body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let raw_body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return GatewayError::bad_request(format!("invalid JSON: {error}")).into_response();
+        }
+    };
+    let envelope: GatewayRequestEnvelope = match serde_json::from_value(raw_body.clone()) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return GatewayError::bad_request(format!("invalid compact request envelope: {error}"))
+                .into_response();
+        }
+    };
+    if envelope.stream {
+        return GatewayError::bad_request("responses compact does not support streaming")
+            .into_response();
+    }
+
+    let ctx = GatewayContext::extract(&headers, envelope.prompt_cache_key.as_deref());
+    let routing_now = Instant::now();
+    let route_started = Instant::now();
+    let (provider, route_id) = {
+        let mut routing = state.ai_gateway_routing.lock().await;
+        routing.evict_stale(routing_now);
+        match resolve_provider_with_state_for_type(
+            &envelope.model,
+            ctx.session_id.as_deref(),
+            &gw_config,
+            &mut routing,
+            routing_now,
+            &ProviderType::OpenAiResponses,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(routing);
+                let log_context = request_logging_enabled
+                    .then(|| {
+                        insert_initial_log(
+                            &state.ai_gateway_request_logs,
+                            &ctx,
+                            &headers,
+                            &envelope,
+                            None,
+                            &raw_body,
+                            started_at,
+                            created_at_ms,
+                            request_log_details_enabled,
+                        )
+                    })
+                    .flatten();
+                update_failed_log(&log_context, &error.message);
+                return error.into_response();
+            }
+        }
+    };
+    let route_ms = request_log::elapsed_ms(route_started);
+    let log_context = request_logging_enabled
+        .then(|| {
+            insert_initial_log(
+                &state.ai_gateway_request_logs,
+                &ctx,
+                &headers,
+                &envelope,
+                Some(provider),
+                &raw_body,
+                started_at,
+                created_at_ms,
+                request_log_details_enabled,
+            )
+        })
+        .flatten();
+    let upstream_model = provider
+        .resolve_upstream_model(&envelope.model)
+        .unwrap_or(envelope.model.as_str())
+        .to_string();
+
+    info!(
+        model = %envelope.model,
+        upstream_model = %upstream_model,
+        provider = %provider.name,
+        session_id = ?ctx.session_id,
+        prompt_cache_key = %ctx.prompt_cache_key,
+        in_flight,
+        route_ms,
+        details = request_log_details_enabled,
+        "ai-gateway compact request routed"
+    );
+
+    let http_client = crate::outbound_http::get();
+    let result = openai_responses::passthrough_compact(
+        &http_client,
+        &ctx,
+        raw_body,
+        &upstream_model,
+        provider,
+        log_context.clone(),
+    )
+    .await;
+    let outcome = classify_outcome(&result);
+    record_routing_outcome(&state, &route_id, outcome).await;
+    match result {
+        Ok(mut response) => {
+            set_models_etag_header(&mut response, &models_etag);
+            response
+        }
+        Err(error) => {
+            update_failed_log(&log_context, &error.message);
+            error.into_response()
+        }
+    }
+}
+
 /// POST /ai-gateway/v1/responses
 pub async fn handle_responses(
     State(state): State<SharedState>,
@@ -187,6 +445,10 @@ pub async fn handle_responses(
     let _in_flight_guard = AiGatewayInFlightGuard;
 
     // 1. 解析请求 body
+    let body = match decode_request_body(&headers, body) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     let mut raw_body: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -280,26 +542,50 @@ pub async fn handle_responses(
         .resolve_upstream_model(&envelope.model)
         .unwrap_or(envelope.model.as_str())
         .to_string();
-    if inject_hosted_web_search_into_lite_request_tools(
-        &mut raw_body,
-        &envelope.model,
-        &provider.provider_type,
-    ) {
+    // Responses Lite rejects hosted tools such as web_search:
+    // "only supports function tools, custom tools, and client-executed tool search."
+    // Never inject hosted web_search into Lite requests; strip if present.
+    let stripped_hosted_web_search =
+        strip_hosted_web_search_from_lite_request_tools(&mut raw_body, &provider.provider_type);
+    if stripped_hosted_web_search > 0 {
         info!(
             model = %envelope.model,
             provider = %provider.name,
-            "injected hosted web_search into top-level tools for Responses Lite request"
+            stripped = stripped_hosted_web_search,
+            "stripped hosted web_search from Responses Lite request tools"
         );
     }
+    let tool_preparation = match prepare_for_provider(&mut raw_body, &provider.provider_type) {
+        Ok(preparation) => preparation,
+        Err(error) => {
+            update_failed_log(&log_context, &format!("invalid Responses tools: {error}"));
+            return GatewayError::bad_request(format!("invalid Responses tools: {error}"))
+                .into_response();
+        }
+    };
+    if tool_preparation.changed() {
+        info!(
+            model = %envelope.model,
+            provider = %provider.name,
+            carriers_removed = tool_preparation.carriers_removed,
+            tools_added = tool_preparation.tools_added,
+            duplicates_removed = tool_preparation.duplicates_removed,
+            grok_tools_converted = tool_preparation.grok_tools_converted,
+            grok_hosted_tools_normalized = tool_preparation.grok_hosted_tools_normalized,
+            "prepared Responses tools for upstream provider"
+        );
+    }
+    let grok_tool_names = tool_preparation.grok_tool_names;
     let http_client = crate::outbound_http::get();
     match provider.provider_type {
         ProviderType::OpenAiResponses | ProviderType::GrokResponses => {
-            let result = openai_responses::passthrough(
+            let result = openai_responses::passthrough_with_tool_names(
                 &http_client,
                 &ctx,
                 raw_body,
                 &upstream_model,
                 provider,
+                grok_tool_names,
                 log_context.clone(),
             )
             .await;
@@ -385,6 +671,49 @@ pub async fn handle_responses(
     }
 }
 
+fn decode_request_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, GatewayError> {
+    let mut encodings = Vec::new();
+    for value in headers.get_all(CONTENT_ENCODING) {
+        let value = value
+            .to_str()
+            .map_err(|_| GatewayError::bad_request("invalid Content-Encoding header"))?;
+        encodings.extend(
+            value.split(',').map(str::trim).filter(|encoding| {
+                !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
+            }),
+        );
+    }
+
+    if encodings.is_empty() {
+        return Ok(body);
+    }
+    if encodings.len() != 1 || !encodings[0].eq_ignore_ascii_case("zstd") {
+        return Err(GatewayError::bad_request(format!(
+            "unsupported Content-Encoding: {}",
+            encodings.join(", ")
+        )));
+    }
+
+    let decoder =
+        zstd::stream::read::Decoder::new(Cursor::new(body.as_ref())).map_err(|error| {
+            GatewayError::bad_request(format!("invalid zstd request body: {error}"))
+        })?;
+    let mut decoded = Vec::new();
+    decoder
+        .take((MAX_DECOMPRESSED_REQUEST_BODY_BYTES as u64) + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|error| {
+            GatewayError::bad_request(format!("invalid zstd request body: {error}"))
+        })?;
+    if decoded.len() > MAX_DECOMPRESSED_REQUEST_BODY_BYTES {
+        return Err(GatewayError::bad_request(format!(
+            "decompressed request body exceeds {} bytes",
+            MAX_DECOMPRESSED_REQUEST_BODY_BYTES
+        )));
+    }
+    Ok(Bytes::from(decoded))
+}
+
 struct AiGatewayInFlightGuard;
 
 impl Drop for AiGatewayInFlightGuard {
@@ -410,6 +739,16 @@ fn classify_outcome<T>(result: &Result<T, GatewayError>) -> RoutingOutcome {
         Ok(_) => RoutingOutcome::Success,
         Err(e) if is_circuit_breaker_failure(e.status) => RoutingOutcome::UpstreamFailure,
         Err(_) => RoutingOutcome::Ignore,
+    }
+}
+
+fn classify_response_status(status: axum::http::StatusCode) -> RoutingOutcome {
+    if status.is_success() {
+        RoutingOutcome::Success
+    } else if is_circuit_breaker_failure(status) {
+        RoutingOutcome::UpstreamFailure
+    } else {
+        RoutingOutcome::Ignore
     }
 }
 
@@ -539,18 +878,54 @@ fn remove_markdown_h2_section(text: &str, heading: &str) -> Option<String> {
     })
 }
 
-fn inject_hosted_web_search_into_lite_request_tools(
+/// Responses Lite upstream rejects hosted tools (`web_search`, etc.) with:
+/// `X-OpenAI-Internal-Codex-Responses-Lite only supports function tools,
+/// custom tools, and client-executed tool search.`
+///
+/// Strip any hosted web_search entries from both top-level `tools` and Lite
+/// `input[].additional_tools.tools`.
+/// Do not inject hosted web_search as a compatibility path for Lite.
+fn strip_hosted_web_search_from_lite_request_tools(
     raw_body: &mut serde_json::Value,
-    model: &str,
     provider_type: &ProviderType,
-) -> bool {
-    if provider_type != &ProviderType::OpenAiResponses || !is_gpt_5_6_family(model) {
-        return false;
+) -> usize {
+    if provider_type != &ProviderType::OpenAiResponses || !is_responses_lite_request(raw_body) {
+        return 0;
     }
 
-    // Lite keeps client-executed schemas in additional_tools, while the upstream
-    // still discovers hosted tools such as web_search from the top-level tools array.
-    let is_lite_request = raw_body
+    let mut stripped = raw_body
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(strip_hosted_web_search_tools)
+        .unwrap_or(0);
+
+    if let Some(input) = raw_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in input {
+            if item.get("type").and_then(serde_json::Value::as_str) != Some("additional_tools") {
+                continue;
+            }
+            stripped += item
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+                .map(strip_hosted_web_search_tools)
+                .unwrap_or(0);
+        }
+    }
+
+    stripped
+}
+
+fn strip_hosted_web_search_tools(tools: &mut Vec<serde_json::Value>) -> usize {
+    let before = tools.len();
+    tools.retain(|tool| !is_hosted_web_search_tool(tool));
+    before.saturating_sub(tools.len())
+}
+
+fn is_responses_lite_request(raw_body: &serde_json::Value) -> bool {
+    raw_body
         .get("input")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|input| {
@@ -558,70 +933,7 @@ fn inject_hosted_web_search_into_lite_request_tools(
                 item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools")
                     && item.get("tools").is_some_and(serde_json::Value::is_array)
             })
-        });
-    if !is_lite_request {
-        return false;
-    }
-    if has_responses_lite_web_run(raw_body) {
-        return false;
-    }
-
-    if raw_body.get("tools").is_none_or(serde_json::Value::is_null) {
-        raw_body["tools"] = json!([]);
-    }
-    let Some(tools) = raw_body
-        .get_mut("tools")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return false;
-    };
-    if tools.iter().any(is_hosted_web_search_tool) {
-        return false;
-    }
-
-    tools.push(json!({
-        "type": "web_search",
-        "external_web_access": true,
-        "search_content_types": ["text", "image"]
-    }));
-    true
-}
-
-fn has_responses_lite_web_run(raw_body: &serde_json::Value) -> bool {
-    raw_body
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|input| {
-            input.iter().any(|item| {
-                if item.get("type").and_then(serde_json::Value::as_str) != Some("additional_tools")
-                {
-                    return false;
-                }
-
-                item.get("tools")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|tools| tools.iter().any(is_responses_lite_web_run_namespace))
-            })
         })
-}
-
-fn is_responses_lite_web_run_namespace(tool: &serde_json::Value) -> bool {
-    tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace")
-        && tool.get("name").and_then(serde_json::Value::as_str) == Some("web")
-        && tool
-            .get("tools")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|tools| {
-                tools.iter().any(|tool| {
-                    tool.get("type").and_then(serde_json::Value::as_str) == Some("function")
-                        && tool.get("name").and_then(serde_json::Value::as_str) == Some("run")
-                })
-            })
-}
-
-fn is_gpt_5_6_family(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
 }
 
 fn is_hosted_web_search_tool(tool: &serde_json::Value) -> bool {
@@ -682,11 +994,12 @@ pub async fn handle_request_logs(
 
 /// DELETE /ai-gateway/request-logs
 pub async fn handle_clear_request_logs(State(state): State<SharedState>) -> impl IntoResponse {
-    match state.ai_gateway_request_logs.delete_all() {
+    let store = state.ai_gateway_request_logs.clone();
+    match run_request_log_cleanup(move || store.delete_all()).await {
         Ok(deleted) => Json(json!({ "deleted": deleted })).into_response(),
         Err(err) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": err.to_string() })),
+            Json(json!({ "error": err })),
         )
             .into_response(),
     }
@@ -699,14 +1012,24 @@ pub async fn handle_clear_old_request_logs(
 ) -> impl IntoResponse {
     let days = query.days.unwrap_or(3).clamp(1, 3650);
     let cutoff_ms = request_log::now_ms().saturating_sub((days as i64) * 24 * 60 * 60 * 1000);
-    match state.ai_gateway_request_logs.delete_older_than(cutoff_ms) {
+    let store = state.ai_gateway_request_logs.clone();
+    match run_request_log_cleanup(move || store.delete_older_than(cutoff_ms)).await {
         Ok(deleted) => Json(json!({ "deleted": deleted })).into_response(),
         Err(err) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": err.to_string() })),
+            Json(json!({ "error": err })),
         )
             .into_response(),
     }
+}
+
+async fn run_request_log_cleanup(
+    operation: impl FnOnce() -> rusqlite::Result<usize> + Send + 'static,
+) -> Result<usize, String> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|err| format!("request log cleanup task failed: {err}"))?
+        .map_err(|err| err.to_string())
 }
 
 /// GET /ai-gateway/request-logs/{id}
@@ -836,6 +1159,58 @@ fn insert_initial_image_log(
     }
 }
 
+fn insert_initial_alpha_search_log(
+    store: &RequestLogStore,
+    ctx: &GatewayContext,
+    headers: &HeaderMap,
+    model: &str,
+    provider: Option<&ProviderConfig>,
+    raw_body: &serde_json::Value,
+    started_at: Instant,
+    created_at_ms: i64,
+    details_enabled: bool,
+) -> Option<RequestLogContext> {
+    let record = RequestLogRecord {
+        request_id: ctx.request_id.clone(),
+        model_id: model.to_string(),
+        stream: false,
+        channel: provider
+            .map(|provider| provider.name.clone())
+            .unwrap_or_else(|| "-".to_string()),
+        provider_type: "alpha_search".to_string(),
+        status: "running".to_string(),
+        usage: Default::default(),
+        cost_usd: None,
+        latency_ms: None,
+        ttft_ms: None,
+        created_at_ms,
+        error_message: None,
+        request_headers_json: details_enabled
+            .then(|| request_log::headers_to_redacted_json(headers))
+            .flatten(),
+        request_json: details_enabled
+            .then(|| serde_json::to_string(raw_body).ok())
+            .flatten(),
+        upstream_request_body_bytes: None,
+        upstream_request_headers_json: None,
+        upstream_request_json: None,
+        upstream_response_sse: None,
+        response_json: None,
+    };
+    match store.insert_record(&record) {
+        Ok(log_id) => Some(RequestLogContext {
+            store: store.clone(),
+            log_id,
+            started_at,
+            details_enabled,
+        }),
+        Err(error) => {
+            request_log::log_insert_error(error);
+            None
+        }
+    }
+}
+
 fn update_failed_log(log_context: &Option<RequestLogContext>, message: &str) {
     let Some(log_context) = log_context else {
         return;
@@ -876,9 +1251,13 @@ fn set_etag_header(response: &mut axum::response::Response, etag: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::time::Instant;
 
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::{
+        body::Bytes,
+        http::{HeaderMap, HeaderValue, header::CONTENT_ENCODING},
+    };
     use serde_json::json;
 
     use crate::ai_gateway::config::{ProviderConfig, ProviderType};
@@ -887,8 +1266,9 @@ mod tests {
     use crate::ai_gateway::request_log::RequestLogStore;
 
     use super::{
-        GatewayRequestEnvelope, deserialize_gateway_request, filter_image_generation_tools,
-        inject_hosted_web_search_into_lite_request_tools, insert_initial_image_log,
+        GatewayRequestEnvelope, decode_request_body, deserialize_gateway_request,
+        filter_image_generation_tools, insert_initial_image_log,
+        strip_hosted_web_search_from_lite_request_tools,
     };
 
     fn lite_request(model: &str) -> serde_json::Value {
@@ -910,6 +1290,33 @@ mod tests {
                 }
             ]
         })
+    }
+
+    #[test]
+    fn decode_request_body_accepts_codex_zstd_payload() {
+        let original = br#"{"model":"gpt-5.6-sol","stream":true,"input":"hello"}"#;
+        let compressed =
+            zstd::stream::encode_all(Cursor::new(original), 3).expect("compress request body");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+
+        let decoded = decode_request_body(&headers, Bytes::from(compressed))
+            .expect("decode zstd request body");
+
+        assert_eq!(decoded.as_ref(), original);
+        serde_json::from_slice::<serde_json::Value>(&decoded).expect("decoded JSON");
+    }
+
+    #[test]
+    fn decode_request_body_rejects_unknown_content_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let error = decode_request_body(&headers, Bytes::from_static(b"payload"))
+            .expect_err("unsupported encoding should fail");
+
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("unsupported Content-Encoding"));
     }
 
     #[test]
@@ -1141,164 +1548,144 @@ mod tests {
     }
 
     #[test]
-    fn injects_hosted_web_search_into_gpt_5_6_lite_top_level_tools() {
+    fn does_not_add_hosted_web_search_to_lite_request_tools() {
         let mut body = lite_request("gpt-5.6-sol");
 
-        assert!(inject_hosted_web_search_into_lite_request_tools(
-            &mut body,
-            "gpt-5.6-sol",
-            &ProviderType::OpenAiResponses,
-        ));
-
-        assert_eq!(body["input"][0]["tools"].as_array().unwrap().len(), 2);
-        let tools = body["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
         assert_eq!(
-            tools[0],
-            json!({
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut body,
+                &ProviderType::OpenAiResponses,
+            ),
+            0
+        );
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn strips_hosted_web_search_from_lite_top_level_tools() {
+        let mut body = lite_request("gpt-5.6-terra");
+        body["tools"] = json!([
+            {
+                "type": "function",
+                "name": "existing_tool",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {
                 "type": "web_search",
                 "external_web_access": true,
                 "search_content_types": ["text", "image"]
-            })
+            },
+            {"type": "web_search_preview"}
+        ]);
+
+        assert_eq!(
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut body,
+                &ProviderType::OpenAiResponses,
+            ),
+            2
         );
-    }
-
-    #[test]
-    fn hosted_web_search_lite_injection_is_idempotent() {
-        let mut body = lite_request("gpt-5.6-terra");
-
-        assert!(inject_hosted_web_search_into_lite_request_tools(
-            &mut body,
-            "gpt-5.6-terra",
-            &ProviderType::OpenAiResponses,
-        ));
-        assert!(!inject_hosted_web_search_into_lite_request_tools(
-            &mut body,
-            "gpt-5.6-terra",
-            &ProviderType::OpenAiResponses,
-        ));
 
         let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "existing_tool");
         assert_eq!(
-            tools
-                .iter()
-                .filter(|tool| tool["type"] == "web_search")
-                .count(),
-            1
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut body,
+                &ProviderType::OpenAiResponses,
+            ),
+            0
         );
     }
 
     #[test]
-    fn hosted_web_search_lite_injection_is_scoped_to_openai_gpt_5_6() {
-        let mut older_model = lite_request("gpt-5.5");
-        let mut grok_provider = lite_request("gpt-5.6-luna");
+    fn strips_hosted_web_search_from_lite_additional_tools() {
+        let mut body = lite_request("gpt-5.6-sol");
+        body["input"][0]["tools"] = json!([
+            {
+                "type": "function",
+                "name": "existing_tool",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {
+                "type": "custom",
+                "name": "exec",
+                "description": "Run JavaScript."
+            },
+            {
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search tools",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {"type": "web_search"},
+            {"type": "web_search_preview"}
+        ]);
 
-        assert!(!inject_hosted_web_search_into_lite_request_tools(
-            &mut older_model,
-            "gpt-5.5",
-            &ProviderType::OpenAiResponses,
-        ));
-        assert!(!inject_hosted_web_search_into_lite_request_tools(
-            &mut grok_provider,
-            "gpt-5.6-luna",
-            &ProviderType::GrokResponses,
-        ));
-        assert!(older_model.get("tools").is_none());
-        assert!(grok_provider.get("tools").is_none());
+        assert_eq!(
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut body,
+                &ProviderType::OpenAiResponses,
+            ),
+            2
+        );
+
+        let tools = body["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[1]["type"], "custom");
+        assert_eq!(tools[2]["type"], "tool_search");
+        assert_eq!(tools[2]["execution"], "client");
     }
 
     #[test]
-    fn hosted_web_search_lite_injection_requires_additional_tools() {
+    fn hosted_web_search_lite_strip_is_scoped_to_openai_lite() {
+        let mut non_lite = json!({
+            "model": "gpt-5.4",
+            "input": [{"type": "message", "role": "user", "content": []}],
+            "tools": [{"type": "web_search"}]
+        });
+        let mut grok_lite = lite_request("gpt-5.6-luna");
+        grok_lite["tools"] = json!([{"type": "web_search"}]);
+
+        assert_eq!(
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut non_lite,
+                &ProviderType::OpenAiResponses,
+            ),
+            0
+        );
+        assert_eq!(non_lite["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut grok_lite,
+                &ProviderType::GrokResponses,
+            ),
+            0
+        );
+        assert_eq!(grok_lite["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hosted_web_search_lite_strip_requires_additional_tools() {
         let mut body = json!({
             "model": "gpt-5.6-sol",
             "input": [{"type": "message", "role": "user", "content": []}],
-            "tools": [{"type": "function", "name": "exec"}]
+            "tools": [
+                {"type": "function", "name": "exec"},
+                {"type": "web_search"}
+            ]
         });
 
-        assert!(!inject_hosted_web_search_into_lite_request_tools(
-            &mut body,
-            "gpt-5.6-sol",
-            &ProviderType::OpenAiResponses,
-        ));
-        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn hosted_web_search_lite_injection_skips_native_web_run() {
-        let mut body = lite_request("gpt-5.6-sol");
-        body["input"][0]["tools"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "type": "namespace",
-                "name": "web",
-                "tools": [{
-                    "type": "function",
-                    "name": "run",
-                    "parameters": {"type": "object"}
-                }]
-            }));
-
-        assert!(!inject_hosted_web_search_into_lite_request_tools(
-            &mut body,
-            "gpt-5.6-sol",
-            &ProviderType::OpenAiResponses,
-        ));
-        assert!(body.get("tools").is_none());
-    }
-
-    #[test]
-    fn hosted_web_search_lite_injection_does_not_confuse_other_namespaced_tools_with_web_run() {
-        let mut other_web_tool = lite_request("gpt-5.6-sol");
-        other_web_tool["input"][0]["tools"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "type": "namespace",
-                "name": "web",
-                "tools": [{"type": "function", "name": "open"}]
-            }));
-        let mut other_namespace = lite_request("gpt-5.6-sol");
-        other_namespace["input"][0]["tools"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "type": "namespace",
-                "name": "browser",
-                "tools": [{"type": "function", "name": "run"}]
-            }));
-
-        assert!(inject_hosted_web_search_into_lite_request_tools(
-            &mut other_web_tool,
-            "gpt-5.6-sol",
-            &ProviderType::OpenAiResponses,
-        ));
-        assert!(inject_hosted_web_search_into_lite_request_tools(
-            &mut other_namespace,
-            "gpt-5.6-sol",
-            &ProviderType::OpenAiResponses,
-        ));
-    }
-
-    #[test]
-    fn hosted_web_search_lite_injection_preserves_existing_top_level_tools() {
-        let mut body = lite_request("gpt-5.6-luna");
-        body["tools"] = json!([{
-            "type": "function",
-            "name": "existing_tool",
-            "parameters": {"type": "object", "properties": {}}
-        }]);
-
-        assert!(inject_hosted_web_search_into_lite_request_tools(
-            &mut body,
-            "gpt-5.6-luna",
-            &ProviderType::OpenAiResponses,
-        ));
-
-        let tools = body["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "existing_tool");
-        assert_eq!(tools[1]["type"], "web_search");
+        assert_eq!(
+            strip_hosted_web_search_from_lite_request_tools(
+                &mut body,
+                &ProviderType::OpenAiResponses,
+            ),
+            0
+        );
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
     }
 
     #[test]
